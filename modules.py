@@ -216,6 +216,7 @@ class DetrModel(L.LightningModule):
         warmup_epoches=1,
         pick_num=6,
         mask_alpha=0.8,
+        sample_three=True,
     ):
         super().__init__()
         if isinstance(model, dict):
@@ -274,6 +275,8 @@ class DetrModel(L.LightningModule):
 
         self.num = pick_num
         self.mask_alpha = mask_alpha
+
+        self.sample_three = sample_three
 
         self.box_in_for_mask = True
 
@@ -349,13 +352,6 @@ class DetrModel(L.LightningModule):
 
             pixel_values = batch["pixel_values"].to(self.device)
             pixel_mask = batch["pixel_mask"].to(self.device)
-            if "mark" in batch:
-                mark = batch["mark"][0]
-            else:
-                mark = None
-
-            if mark == "":
-                mark = None
             required_labels = []
             for t in batch["labels"]:
                 sample = {}
@@ -366,29 +362,23 @@ class DetrModel(L.LightningModule):
             # labels = [
             #     {k: v.to(self.device) for k, v in t.items()} for t in batch["labels"]
             # ]
-
+            b, c, w, h = pixel_values.shape
+            if c > 3 and self.sample_three:
+                pixel_values = pixel_values[:, [0, c // 2, -1], :, :]
             outputs = self(
                 pixel_values=pixel_values,
                 pixel_mask=pixel_mask,
                 labels=required_labels,
-                mark=mark,
             )
-            if mark is not None:
-                loss += outputs[mark].loss
-                if loss_dict is None:
-                    loss_dict = outputs[mark].loss_dict.detach().cpu()
-                else:
-                    for i in loss_dict:
-                        loss_dict[i] += outputs[mark].loss_dict[i].detach().cpu()
-            else:
-                loss = outputs.loss
+            loss += outputs.loss
+            if loss_dict is None:
                 loss_dict = outputs.loss_dict
+            else:
                 for i in loss_dict:
-                    loss_dict[i] = loss_dict[i].detach().cpu()
+                    loss_dict[i] += outputs.loss_dict[i]
             if return_outputs:
                 return loss, loss_dict, outputs
-            return loss, loss_dict
-            return loss, loss_dict
+            return loss, {"loss": loss}
         else:
             raise ValueError("not in stage 1")
 
@@ -642,19 +632,25 @@ class DetrModel(L.LightningModule):
             # loss_dict["auroc_mask"] = loss_dict3["auroc"]
         elif "stage 1 + 2" in self.stage:
             loss, loss_dict, output = self._common_step_stage1(batch[0], 0, None, True)
+
+            n, _, _, _ = batch[0]["pixel_values"].shape
             retdict = utils.process(output, batch[0]["labels"])
             data2 = utils.convertStage2Dataset(retdict)
+
             self.stage = "stage 2"
             x = data2.x
             y = data2.y
+
+            predicts = len(y) // n
             edge_index = data2.edge_index
-            mask = torch.ones_like(y, dtype=torch.bool)
+            mask = torch.zeros_like(y, dtype=torch.bool)
+            mask[(n // 2) * predicts : (n // 2 + 1) * predicts] = True
             boxes = data2.boxes if hasattr(data2, "boxes") else None
             box_masks = data2.box_masks if hasattr(data2, "box_masks") else None
-            edge_label = data2.edge_label  # if hasattr(batch, "edge_label") else None
-            # edge_label = None
-            if edge_label is None:
-                print("edge_label is None")
+            # edge_label = data2.edge_label  # if hasattr(batch, "edge_label") else None
+            edge_label = None
+            # if edge_label is None:
+            #     print("edge_label is None")
             loss2, loss_dict2 = self.common_step_stage2(
                 x, edge_index, mask, y, boxes, box_masks, edge_label
             )
@@ -698,9 +694,12 @@ class DetrModel(L.LightningModule):
         loss, loss_dict = self._common_step(batch)
         # logs metrics for each training_step, and the average across the epoch
         self.log("training_loss", loss, prog_bar=True)
+        res = {}
+        for k, v in loss_dict.items():
+            res[k] = v.detach().cpu()
         # for k, v in loss_dict.items():
         #     self.log("train_" + k, v.item(), prog_bar=False)
-        self.training_step_outputs.append(loss_dict)
+        self.training_step_outputs.append(res)
         return loss
 
     def validation_step(self, batch, batch_idx=0, loader_idx=0):
@@ -1019,10 +1018,10 @@ class DoubleConv(nn.Module):
         if not mid_channels:
             mid_channels = out_channels
         self.double_conv = nn.Sequential(
-            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1),
+            nn.Conv2d(in_channels, mid_channels, kernel_size=7, padding=3),
             nn.GroupNorm(1, mid_channels),
             nn.GELU(),
-            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1),
+            nn.Conv2d(mid_channels, out_channels, kernel_size=7, padding=3),
             nn.GroupNorm(1, out_channels),
         )
 
@@ -1081,33 +1080,27 @@ class Up(nn.Module):
 
 
 class VitForMask(nn.Module):
-    def __init__(self, c_in=3, c_out=1, embed_dim=272, sigmoid=True):
+    def __init__(self, c_in=11, c_out=11, embed_dim=272, sigmoid=True):
         super().__init__()
         # self.ini = DoubleConv()
 
-        # 16 * 800 * 800
-        self.inc = DoubleConv(c_in + 1, 16)
+        self.inc = DoubleConv(c_in + 1, 32)
 
-        # 16 * 400 * 400
-        self.down1 = Down(16, 32, embed_dim)
+        self.down1 = Down(32, 64, embed_dim)
 
-        # 64 * 200 * 200
-        self.down2 = Down(32, 64, embed_dim)
+        self.down2 = Down(64, 128, embed_dim)
 
-        # 128 * 100 * 100
-        self.down3 = Down(64, 128, embed_dim)
+        self.down3 = Down(128, 256, embed_dim)
 
-        # 256 * 50 * 50
-        self.down4 = Down(128, 512, embed_dim)
+        self.down4 = Down(256, 1024, embed_dim)
 
-        # 512 * 25 * 25
         # self.down5 = Down(256, 512, embed_dim)
-        self.l = nn.Sequential(nn.Linear(embed_dim, 512), nn.GELU())
-        self.pos_embed = nn.Parameter(torch.randn(1, 2500 + 1, 512))
+        self.l = nn.Sequential(nn.Linear(embed_dim, 1024), nn.GELU())
+        self.pos_embed = nn.Parameter(torch.randn(1, 1024 + 1, 1024))
         self.transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
-                d_model=512,
-                nhead=8,
+                d_model=1024,
+                nhead=16,
                 dim_feedforward=1024,
                 dropout=0.1,
                 activation="gelu",
@@ -1115,20 +1108,15 @@ class VitForMask(nn.Module):
             num_layers=6,
         )
 
-        # 128 * 100 * 100
-        self.up3 = Up(512 + 128, 64, (100, 100), embed_dim)
+        self.up3 = Up(1024 + 256, 128, (64, 64), embed_dim)
 
-        # 64 * 200 * 200
-        self.up4 = Up(128, 32, (200, 200), embed_dim)
+        self.up4 = Up(256, 64, (128, 128), embed_dim)
 
-        # 32 * 400 * 400
-        self.up5 = Up(64, 16, (400, 400), embed_dim)
+        self.up5 = Up(128, 32, (256, 256), embed_dim)
 
-        # 32 * 800 * 800
-        self.up6 = Up(32, 32, (800, 800), embed_dim)
+        self.up6 = Up(64, 64, (512, 512), embed_dim)
 
-        # 1 * 800 * 800
-        self.outc = nn.Conv2d(32, c_out, kernel_size=1)
+        self.outc = nn.Conv2d(64, c_out, kernel_size=1)
 
         self.sigmoid = sigmoid
 
@@ -1153,25 +1141,29 @@ class VitForMask(nn.Module):
         x = torch.cat((x, mask), dim=1)
 
         x1 = self.inc(x)
+
         x2 = self.down1(x1, t)
+
         x3 = self.down2(x2, t)
+
         x4 = self.down3(x3, t)
+
         x5 = self.down4(x4, t)
 
-        x5 = x5.view(-1, 512, 2500).transpose(1, 2)
+        x5 = x5.view(-1, 1024, 1024).transpose(1, 2)
         l = self.l(t).unsqueeze(1)
         x = torch.cat((l, x5), dim=1)
         x += self.pos_embed
         # x5 = x5.transpose()
         x = self.transformer(x)
         x = x[:, 1:, :]
-        x = x.transpose(1, 2).view(-1, 512, 50, 50)
+        x = x.transpose(1, 2).view(-1, 1024, 32, 32)
 
         x = self.up3(x, x4, t)
         x = self.up4(x, x3, t)
         x = self.up5(x, x2, t)
         x = self.up6(x, x1, t)
-        output = self.outc(x).squeeze(1)
+        output = self.outc(x)  # .squeeze(1)
 
         if self.sigmoid:
             output = torch.sigmoid(output)

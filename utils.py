@@ -667,7 +667,10 @@ def buildModel(configs, args, checkpoint=None):
                 seg_model.conditional_detr.load_state_dict(model.state_dict())
             model = seg_model
         elif configs["model"]["task"] == "detection":
-            if len(configs["model"]["pretrained"]) > 0:
+            if (
+                "pretrained" in configs["model"]
+                and len(configs["model"]["pretrained"]) > 0
+            ):
                 model = ConditionalDetrForObjectDetection.from_pretrained(
                     configs["model"]["pretrained"], ignore_mismatched_sizes=True, **args
                 )
@@ -676,7 +679,7 @@ def buildModel(configs, args, checkpoint=None):
                 model = ConditionalDetrForObjectDetection(config)
 
     elif configs["model"]["name"] == "deformable_detr":
-        if len(configs["model"]["pretrained"]) > 0:
+        if "pretrained" in configs["model"] and len(configs["model"]["pretrained"]) > 0:
             model = DeformableDetrForObjectDetection.from_pretrained(
                 configs["model"]["pretrained"], ignore_mismatched_sizes=True, **args
             )
@@ -805,7 +808,10 @@ def getModel(configs):
 
     if "load" in configs["model"] and configs["model"]["load"] is not None:
         t = torch.load(configs["model"]["load"], map_location="cpu")
-        ckpt = t["state_dict"]
+        if configs["model"]["load"].endswith(".ckpt"):
+            ckpt = t["state_dict"]
+        else:
+            ckpt = t
         need_del = []
         p = list(model.state_dict().keys())  # [j for j, _ in model.named_parameters()]
         # print("model parameters ", p)

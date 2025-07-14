@@ -261,7 +261,7 @@ class CocoDetection(torchvision.datasets.vision.VisionDataset):
         map_class=None,
         transform=None,
         add_classname=False,
-        maxsize=800,
+        resize=512,
         norm="none",
         filtermin=5,
     ):
@@ -287,7 +287,7 @@ class CocoDetection(torchvision.datasets.vision.VisionDataset):
         self.classes = pd.DataFrame(self.coco.dataset["categories"])
         self.classes = self.classes.set_index("id")
         self.add_classname = add_classname
-        self.maxsize = maxsize
+        self.resize = resize
         self.norm = norm
 
         self.filtermin = filtermin
@@ -400,11 +400,17 @@ class CocoDetection(torchvision.datasets.vision.VisionDataset):
         id = self.ids[index]
         image = self._load_image(id)
         if self.norm == "zscore":
-            for i in range(3):
-                image[i] = (image[i] - image[i].mean()) / image[i].std()
+            image = (image - image.mean()) / image.std()
+            # for i in range(3):
+            #     image[i] = (image[i] - image[i].mean()) / image[i].std()
         elif self.norm == "hist":
-            for i in range(3):
-                image[i] = exposure.equalize_hist(image[i])
+            image = exposure.equalize_hist(image)
+
+            c, w, h = image.shape
+            if c == 0:
+                print(id)
+            # for i in range(3):
+            #     image[i] = exposure.equalize_hist(image[i])
         target, _ = self._load_target(id)
 
         return image, target
@@ -443,10 +449,10 @@ class CocoDetection(torchvision.datasets.vision.VisionDataset):
 
         c, h, w = image.shape
         target["orig_size"] = torch.tensor((h, w))
-        if h > self.maxsize or w > self.maxsize:
-            hq = h if h < self.maxsize else self.maxsize
+        if h > self.resize or w > self.resize:
+            hq = h if h < self.resize else self.resize
             hq = hq / h
-            wq = w if w < self.maxsize else self.maxsize
+            wq = w if w < self.resize else self.resize
             wq = wq / w
             r = min(hq, wq)
             temp = transforms.Compose(
@@ -461,29 +467,27 @@ class CocoDetection(torchvision.datasets.vision.VisionDataset):
 
         target["size"] = torch.tensor((h, w))
 
-        mask = torch.zeros((self.maxsize, self.maxsize), dtype=torch.long)
+        mask = torch.zeros((self.resize, self.resize), dtype=torch.long)
         mask[:h, :w] = 1
 
-        padtransform = transforms.Pad(
-            (0, 0, self.maxsize - w, self.maxsize - h), fill=0
-        )
+        padtransform = transforms.Pad((0, 0, self.resize - w, self.resize - h), fill=0)
         image, target = padtransform(image, target)
 
         target["image_id"] = torch.tensor((idx))
 
         target["boxes"] = torch.zeros_like(target["bboxes"], dtype=torch.float32)
         target["boxes"][:, 0] = (target["bboxes"][:, 0] + target["bboxes"][:, 2]) / (
-            self.maxsize * 2
+            self.resize * 2
         )
         target["boxes"][:, 1] = (target["bboxes"][:, 1] + target["bboxes"][:, 3]) / (
-            self.maxsize * 2
+            self.resize * 2
         )
         target["boxes"][:, 2] = (
             -target["bboxes"][:, 0] + target["bboxes"][:, 2]
-        ) / self.maxsize
+        ) / self.resize
         target["boxes"][:, 3] = (
             -target["bboxes"][:, 1] + target["bboxes"][:, 3]
-        ) / self.maxsize
+        ) / self.resize
 
         if self.require_mask:
             target["area"] = target["masks"].sum([1, 2])
@@ -491,8 +495,8 @@ class CocoDetection(torchvision.datasets.vision.VisionDataset):
             target["area"] = (
                 target["boxes"][:, 2]
                 * target["boxes"][:, 3]
-                * self.maxsize
-                * self.maxsize
+                * self.resize
+                * self.resize
             )
 
         target["iscrowd"] = torch.zeros(
@@ -566,7 +570,7 @@ class CocoDataModule(L.LightningDataModule):
                 collate_fn=self.stack_batch,
                 batch_size=self.train_batch_size,
                 shuffle=True,
-                num_workers=4,
+                num_workers=16,
             )
 
         train_sets = []
@@ -577,7 +581,7 @@ class CocoDataModule(L.LightningDataModule):
                     collate_fn=self.stack_batch,
                     batch_size=self.train_batch_size,
                     shuffle=True,
-                    num_workers=4,
+                    num_workers=16,
                 )
             )
         return CombinedLoader(
@@ -632,7 +636,7 @@ class TestDataset(Dataset):
         self.image_path = image_path
         self.image_list = os.listdir(image_path)
         self.norm = norm
-        self.maxsize = maxsize
+        self.resize = maxsize
         # self.transform = transforms.Compose(
         #     [
         #         transforms.ToTensor(),
@@ -665,10 +669,10 @@ class TestDataset(Dataset):
         c, h, w = image.shape
         target["orig_size"] = torch.tensor((h, w))
 
-        if h > self.maxsize or w > self.maxsize:
-            hq = h if h < self.maxsize else self.maxsize
+        if h > self.resize or w > self.resize:
+            hq = h if h < self.resize else self.resize
             hq = hq / h
-            wq = w if w < self.maxsize else self.maxsize
+            wq = w if w < self.resize else self.resize
             wq = wq / w
             r = min(hq, wq)
             temp = transforms.Compose([transforms.Resize((int(r * h), int(r * w)))])
@@ -678,12 +682,10 @@ class TestDataset(Dataset):
 
         target["size"] = torch.tensor((h, w))
 
-        mask = torch.zeros((self.maxsize, self.maxsize), dtype=torch.long)
+        mask = torch.zeros((self.resize, self.resize), dtype=torch.long)
         mask[:h, :w] = 1
 
-        padtransform = transforms.Pad(
-            (0, 0, self.maxsize - w, self.maxsize - h), fill=0
-        )
+        padtransform = transforms.Pad((0, 0, self.resize - w, self.resize - h), fill=0)
         image = padtransform(image)
 
         return {
