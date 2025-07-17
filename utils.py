@@ -444,7 +444,7 @@ def buildStage2(
     # return ret, l
 
 
-def process(outputs, labels, empty=5, need_mask=False):
+def process(outputs, labels, empty=4, need_mask=False):
     ret = []
     boxeses = []
     box_masks = []
@@ -785,6 +785,12 @@ def getModel(configs):
     if "mask_alpha" not in configs["training"]:
         configs["training"]["mask_alpha"] = 0.8
 
+    if "mask_in_channel" not in configs["model"]:
+        configs["model"]["mask_in_channel"] = 3
+
+    if "mask_out_channel" not in configs["model"]:
+        configs["model"]["mask_out_channel"] = 1
+
     model = modules.DetrModel(
         configs["model"]["stage"],
         models,
@@ -801,6 +807,8 @@ def getModel(configs):
         warmup_epoches=configs["training"]["warmup_epoches"],
         pick_num=configs["training"]["pick_num"],
         mask_alpha=configs["training"]["mask_alpha"],
+        mask_in_channel=configs["model"]["mask_in_channel"],
+        mask_out_channel=configs["model"]["mask_out_channel"],
     )
 
     if "load" in configs["model"] and configs["model"]["load"] is not None:

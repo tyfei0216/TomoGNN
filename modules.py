@@ -209,13 +209,14 @@ class DetrModel(L.LightningModule):
         lr_detr=None,
         lr_backbone=None,
         additional_input_dim=10,
-        additional_output_dim=16,
         layer_type="GCNConv",
         dropout=True,
         scheduler_step=-1,
         warmup_epoches=1,
         pick_num=6,
         mask_alpha=0.8,
+        mask_in_channel=11,
+        mask_out_channel=5,
     ):
         super().__init__()
         if isinstance(model, dict):
@@ -243,11 +244,6 @@ class DetrModel(L.LightningModule):
         self.training_step_outputs = []
         self.val_step_outputs = []
         self.additional_input_dim = additional_input_dim
-        self.additional_output_dim = additional_output_dim
-
-        # self.additional_input_layer = AdditionalInputLayer(
-        #     additional_input_dim, additional_output_dim
-        # )
 
         self.acc = torchmetrics.Accuracy(
             task="multiclass", num_classes=output_dim, average="macro"
@@ -268,7 +264,12 @@ class DetrModel(L.LightningModule):
         t[-1] = 0.1
         self.cri = nn.CrossEntropyLoss(weight=t)
         self.output_dim = output_dim
-        self.mask_head = VitForMask(embed_dim=feature_dim, sigmoid=False)
+        self.mask_head = VitForMask(
+            embed_dim=feature_dim,
+            sigmoid=False,
+            c_in=mask_in_channel,
+            c_out=mask_out_channel,
+        )
 
         self.scheduler_step = scheduler_step
 
@@ -348,6 +349,9 @@ class DetrModel(L.LightningModule):
         if "stage 1" in self.stage:
 
             pixel_values = batch["pixel_values"].to(self.device)
+            b, c, h, w = pixel_values.shape
+            if c > 3:
+                pixel_values = pixel_values[:, :3, :, :]
             pixel_mask = batch["pixel_mask"].to(self.device)
             if "mark" in batch:
                 mark = batch["mark"][0]
@@ -402,7 +406,7 @@ class DetrModel(L.LightningModule):
         else:
             loss, loss_dict = self._common_step_stage1(batch, loss, loss_dict)
 
-        return loss, loss_dict
+        return loss, {"loss": loss.detach().cpu()}
 
     def common_step_stage2(
         self,
@@ -552,6 +556,7 @@ class DetrModel(L.LightningModule):
                     batch[0], 0, None, True
                 )
                 # print("stage 2")
+                # print(batch[0]["labels"])
                 retdict = utils.process(
                     output,
                     batch[0]["labels"],
@@ -590,6 +595,11 @@ class DetrModel(L.LightningModule):
                 self.stage = "stage mask"
 
                 img = batch[0]["pixel_values"][n // 2]
+
+                c, w, h = img.shape
+                if c > 3:
+                    img = img[3:, :, :]
+
                 embeds = outputs["embeddings"]
                 objects, _ = embeds.shape
                 obj_per_image = objects // n
@@ -613,7 +623,6 @@ class DetrModel(L.LightningModule):
                     pick_index = sub_box_masks[pick_from]
                     box = boxes[pick_from]
                     masks = retdict["masks"][pick_index]
-
                 else:
                     tensor = torch.arange(len(pick_from))
                     indices = torch.randperm(tensor.size(0))[: self.num]
@@ -622,13 +631,13 @@ class DetrModel(L.LightningModule):
                     box = boxes[selected]
                     pick_index = sub_box_masks[selected]
                     masks = retdict["masks"][pick_index]
-                num_masks = masks.sum(axis=[1, 2])
+                num_masks = masks.sum(axis=[-1, -2, -3])
                 num_masks = num_masks > 0
                 if num_masks.sum() > 0:
                     stage_2_embeds = stage_2_embeds[num_masks]
                     masks = masks[num_masks]
                     box = box[num_masks]
-                    img = img[None, :, :, :].repeat(stage_2_embeds.shape[0], 1, 1, 1)
+                    img = img.repeat(stage_2_embeds.shape[0], 1, 1, 1)
                     loss3, loss_dict3 = self.common_stage_mask(
                         img, stage_2_embeds, masks, True, box
                     )
@@ -652,11 +661,11 @@ class DetrModel(L.LightningModule):
             boxes = data2.boxes if hasattr(data2, "boxes") else None
             box_masks = data2.box_masks if hasattr(data2, "box_masks") else None
             edge_label = data2.edge_label  # if hasattr(batch, "edge_label") else None
-            # edge_label = None
-            if edge_label is None:
-                print("edge_label is None")
+            edge_label = None
+            # if edge_label is None:
+            #     print("edge_label is None")
             loss2, loss_dict2 = self.common_step_stage2(
-                x, edge_index, mask, y, boxes, box_masks, edge_label
+                x, edge_index, mask, y, boxes, box_masks > -1, edge_label
             )
             self.stage = "stage 1 + 2"
             loss = loss + loss2
@@ -1125,10 +1134,10 @@ class VitForMask(nn.Module):
         self.up5 = Up(64, 16, (400, 400), embed_dim)
 
         # 32 * 800 * 800
-        self.up6 = Up(32, 32, (800, 800), embed_dim)
+        self.up6 = Up(32, 16, (800, 800), embed_dim)
 
         # 1 * 800 * 800
-        self.outc = nn.Conv2d(32, c_out, kernel_size=1)
+        self.outc = nn.Conv2d(16, c_out, kernel_size=1)
 
         self.sigmoid = sigmoid
 

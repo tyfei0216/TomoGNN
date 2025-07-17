@@ -51,12 +51,14 @@ def run():
     print("loading dataset")
     # CHECKPOINT = "facebook/detr-resnet-50"
     # image_processor = DetrImageProcessor.from_pretrained(CHECKPOINT)
-    if configs["model"]["stage"] == "stage 1 + 2" or configs["model"][
+    if "mrc" in configs["data"]:
+        ds = data.get_stage12_dataset_mrc(configs)
+    elif configs["model"]["stage"] == "stage 1 + 2" or configs["model"][
         "stage"
     ].startswith("stage 1 + 2 + 3"):
         ds = data.get_stage12_dataset(configs)
     elif configs["model"]["stage"] == "stage 1":
-        ds = data.get_stage1_dataset(configs)
+        ds = data.get_stage12_dataset(configs)
     elif configs["model"]["stage"] == "stage 2":
         ds = data.get_stage2_dataset(configs)
     elif configs["model"]["stage"] == "stage mask":
