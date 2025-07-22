@@ -629,6 +629,8 @@ class MrcDataset(Dataset):
         gap=5,
         length_for_average=10,
         require_mask=False,
+        mask_length=5,
+        mask_input_channels=11,
         add_classname=False,
         filtermin=5,
     ):
@@ -655,10 +657,10 @@ class MrcDataset(Dataset):
         self.length_for_average = length_for_average
         self.add_classname = add_classname
 
-        # self.mask_length = mask_length
+        self.mask_length = mask_length
         self.require_mask = require_mask
 
-        # self.mask_input_channels = mask_input_channels
+        self.mask_input_channels = mask_input_channels
 
         self._filter_ids()
 
@@ -683,7 +685,7 @@ class MrcDataset(Dataset):
         num = (t + self.gap) // self.gap
         return num
 
-    def _get_slice(self, index):
+    def _get_slice(self, index, require_mask=False):
         img = np.zeros(
             (3, self.annotation["mrc_shape"][1], self.annotation["mrc_shape"][2]),
             dtype=np.float32,
@@ -692,7 +694,7 @@ class MrcDataset(Dataset):
         img[0] = np.mean(self.ori_mrc[max(0, index - self.length_for_average) : index])
         img[2] = np.mean(
             self.ori_mrc[
-                index + 1 : min(index + self.length_for_average, len(self.ori_mrc))
+                index + 1 : min(index + self.length_for_average + 1, len(self.ori_mrc))
             ]
         )
         if self.norm == "zscore":
@@ -702,35 +704,36 @@ class MrcDataset(Dataset):
             for i in range(3):
                 img[i] = exposure.equalize_hist(img[i])
 
-        # if self.mask_input_channels > 0:
-        #     m = np.zeros(
-        #         (
-        #             self.mask_input_channels,
-        #             self.annotation["mrc_shape"][1],
-        #             self.annotation["mrc_shape"][2],
-        #         )
-        #     )
-        #     for j in range(
-        #         -(self.mask_input_channels // 2), self.mask_input_channels // 2 + 1
-        #     ):
-        #         d = index + j
-        #         if d < 0 or d >= len(self.ori_mrc):
-        #             continue
-        #         m[j + self.mask_length // 2] = self.ori_mrc[d]
-        #         if self.norm == "zscore":
-        #             m[j + self.mask_length // 2] = (
-        #                 m[j + self.mask_length // 2]
-        #                 - m[j + self.mask_length // 2].mean()
-        #             ) / m[j + self.mask_length // 2].std()
-        #         elif self.norm == "hist":
-        #             m[j + self.mask_length // 2] = exposure.equalize_hist(
-        #                 m[j + self.mask_length // 2]
-        #             )
-        #     img = np.concatenate((img, m), axis=0)
+        if self.mask_input_channels > 0 and require_mask:
+            m = np.zeros(
+                (
+                    self.mask_input_channels,
+                    self.annotation["mrc_shape"][1],
+                    self.annotation["mrc_shape"][2],
+                )
+            )
+            for j in range(
+                -(self.mask_input_channels // 2), self.mask_input_channels // 2 + 1
+            ):
+                d = index + j
+                if d < 0 or d >= len(self.ori_mrc):
+                    continue
+                m[j + self.mask_length // 2] = self.ori_mrc[d]
+                if self.norm == "zscore":
+                    m[j + self.mask_length // 2] = (
+                        m[j + self.mask_length // 2]
+                        - m[j + self.mask_length // 2].mean()
+                    ) / m[j + self.mask_length // 2].std()
+                elif self.norm == "hist":
+                    m[j + self.mask_length // 2] = exposure.equalize_hist(
+                        m[j + self.mask_length // 2]
+                    )
+            img = np.concatenate((img, m), axis=0)
+            # print(img.shape)
 
         return img
 
-    def _get_annotations(self, index):
+    def _get_annotations(self, index, require_mask=False):
         labels = []
         names = []
         bboxes = []
@@ -743,7 +746,7 @@ class MrcDataset(Dataset):
                 labels.append(self.map_class[j])
                 names.append(j)
                 bboxes.append(self.annotation["bboxes"][j][index][i])
-                if self.require_mask:
+                if require_mask:
                     # for _ in range(self.mask_length - 1):
                     #     item_id.append(j + "_" + str(i))
                     #     labels.append(self.mapclass[j])
@@ -767,7 +770,7 @@ class MrcDataset(Dataset):
         bt = torchvision.ops.box_convert(bboxes, "xywh", "xyxy")
         boxes = BoundingBoxes(bt, format="xyxy", canvas_size=self.mrc_shape[1:])
         ret = {"bboxes": boxes, "class_labels": torch.tensor(labels, dtype=torch.long)}
-        if self.require_mask:
+        if require_mask:
             masks = torch.stack([torch.tensor(m) for m in masks], dim=0)
             masks = Mask(masks)
             ret["masks"] = masks
@@ -780,21 +783,23 @@ class MrcDataset(Dataset):
 
         return ret
 
-    def _getitem(self, index):
-        idx = np.min(self.needids) + index * self.gap
-        img = self._get_slice(idx)
+    def _getitem(self, index, offset=0, require_mask=False):
+        idx = np.min(self.needids) + index * self.gap + offset
+        img = self._get_slice(idx, require_mask=require_mask)
         # img = torch.tensor(img, dtype=torch.float32)
-        target = self._get_annotations(idx)
+        target = self._get_annotations(idx, require_mask)
         return img, target, idx
 
-    def __getitem__(self, idx, seed=None):
+    def __getitem__(self, idx, seed=None, offset=0, require_mask=True):
         # idx1 = idx
         # print("call item")
         # if self.needids is not None:
         #     zpos = self.zpos[idx]
         #     idx = self.needids[idx]
 
-        image, target, zpos = self._getitem(idx)
+        require_mask = self.require_mask & require_mask
+
+        image, target, zpos = self._getitem(idx, offset, require_mask)
 
         # print(idx1, idx, len(annotation))
         if len(target) == 0:
@@ -862,15 +867,15 @@ class MrcDataset(Dataset):
             -target["bboxes"][:, 1] + target["bboxes"][:, 3]
         ) / self.maxsize
 
-        if self.require_mask:
-            target["area"] = target["masks"].sum([1, 2])
-        else:
-            target["area"] = (
-                target["boxes"][:, 2]
-                * target["boxes"][:, 3]
-                * self.maxsize
-                * self.maxsize
-            )
+        # if require_mask:
+        #     target["area"] = target["masks"].sum([1, 2])
+        # else:
+        #     target["area"] = (
+        #         target["boxes"][:, 2]
+        #         * target["boxes"][:, 3]
+        #         * self.maxsize
+        #         * self.maxsize
+        #     )
 
         target["iscrowd"] = torch.zeros(
             (len(target["class_labels"])), dtype=torch.int64
@@ -889,6 +894,11 @@ class MrcDataset(Dataset):
         #         target["masks"] = torch.tensor(target["masks"], dtype=torch.bool).view(
         #             -1, self.mask_length, self.maxsize, self.maxsize
         #         )
+
+        if require_mask:
+            # print(image.shape)
+            target["mask_input"] = image[3:]
+            image = image[:3]
 
         ret = {
             "pixel_values": image,
@@ -915,8 +925,17 @@ class MrcDataset2(MrcDataset):
             seed = self.seed
         res = []
         num = self.num
+        offset = random.randint(0, self.gap - 1)
+        offset -= self.gap // 2
         for i in range(num):
-            res.append(super().__getitem__(idx + i, seed))
+            if i == num // 2:
+                res.append(
+                    super().__getitem__(idx + i, seed, offset, require_mask=True)
+                )
+            else:
+                res.append(
+                    super().__getitem__(idx + i, seed, offset, require_mask=False)
+                )
         return stackBatch(res)
 
 
@@ -1060,6 +1079,70 @@ class CocoDataModule(L.LightningDataModule):
 
     def test_dataloader(self):
         return self.testset
+
+
+class TestDatasetMrc(Dataset):
+    def __init__(
+        self, mrc_path, norm="hist", reshape=800, gap=5, length_for_average=10
+    ):
+        self.mrc_path = mrc_path
+        self.ori_mrc = utils.readTomogram(mrc_path)
+
+        self.norm = norm
+        self.reshape = reshape
+        self.gap = gap
+        self.length_for_average = length_for_average
+
+    def __len__(self):
+        return (len(self.ori_mrc) + self.gap - 1) // self.gap
+
+    def __getitem__(self, index):
+        img = np.zeros(
+            (3, self.ori_mrc.shape[1], self.ori_mrc.shape[2]), dtype=np.float32
+        )
+        idx = index * self.gap
+        img[1] = self.ori_mrc[idx]
+        img[0] = np.mean(self.ori_mrc[max(0, idx - self.length_for_average) : idx])
+        img[2] = np.mean(
+            self.ori_mrc[
+                idx + 1 : min(idx + self.length_for_average + 1, len(self.ori_mrc))
+            ]
+        )
+        img[np.isnan(img)] = 0.0
+        if self.norm == "zscore":
+            for i in range(3):
+                img[i] = (img[i] - img[i].mean()) / img[i].std()
+        elif self.norm == "hist":
+            for i in range(3):
+                if np.max(img[i]) - np.min(img[i]) > 0.01:
+                    img[i] = exposure.equalize_hist(img[i])
+
+        c, h, w = img.shape
+
+        if h > self.reshape or w > self.reshape:
+            hq = h if h < self.reshape else self.reshape
+            hq = hq / h
+            wq = w if w < self.reshape else self.reshape
+            wq = wq / w
+            r = min(hq, wq)
+            t = transforms.Compose([transforms.Resize((int(r * h), int(r * w)))])
+            image = t(img)
+            h = int(r * h)
+            w = int(r * w)
+
+        mask = torch.zeros((self.reshape, self.reshape), dtype=torch.long)
+        mask[:h, :w] = 1
+
+        padtransform = transforms.Pad(
+            (0, 0, self.reshape - w, self.reshape - h), fill=0
+        )
+        image = padtransform(image)
+
+        return {
+            "pixel_values": torch.tensor(image),
+            "pixel_mask": torch.tensor(mask),
+            "labels": {"pos": idx, "zposmax": 500, "class_labels": None},
+        }
 
 
 class TestDataset(Dataset):

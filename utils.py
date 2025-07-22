@@ -503,7 +503,10 @@ def process(outputs, labels, empty=4, need_mask=False):
     boxeses = torch.cat(boxeses, dim=0)
     item_ids = [i for j in item_ids for i in j]
     if need_mask:
+        # print(mask)
         mask = torch.cat(mask, dim=0)
+        # print(mask.shape)
+        # print(mask)
         # print(cnts, mask.shape)
         return {
             "feature": ret,

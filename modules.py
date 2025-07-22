@@ -139,6 +139,8 @@ def sigmoid_focal_loss(
         Loss tensor
     """
     prob = inputs.sigmoid()
+    inputs = inputs.squeeze()
+    targets = targets.squeeze()
     ce_loss = nn.functional.binary_cross_entropy_with_logits(
         inputs, targets, reduction="none"
     )
@@ -232,6 +234,7 @@ class DetrModel(L.LightningModule):
             "stage 1 + 2",
             "stage 1 + 2 + 3",
             "stage 1 + 2 + 3 mask",
+            "stage pretrain mask",
             "stage mask",
         ]
         print("model at stage ", stage)
@@ -348,18 +351,21 @@ class DetrModel(L.LightningModule):
 
         if "stage 1" in self.stage:
 
-            pixel_values = batch["pixel_values"].to(self.device)
+            pixel_values = batch["pixel_values"]  # .to(self.device)
             b, c, h, w = pixel_values.shape
             if c > 3:
                 pixel_values = pixel_values[:, :3, :, :]
-            pixel_mask = batch["pixel_mask"].to(self.device)
-            if "mark" in batch:
-                mark = batch["mark"][0]
-            else:
-                mark = None
 
-            if mark == "":
-                mark = None
+            pixel_values = pixel_values.to(self.device)
+
+            pixel_mask = batch["pixel_mask"].to(self.device)
+            # if "mark" in batch:
+            #     mark = batch["mark"][0]
+            # else:
+            #     mark = None
+
+            # if mark == "":
+            #     mark = None
             required_labels = []
             for t in batch["labels"]:
                 sample = {}
@@ -375,20 +381,20 @@ class DetrModel(L.LightningModule):
                 pixel_values=pixel_values,
                 pixel_mask=pixel_mask,
                 labels=required_labels,
-                mark=mark,
+                # mark=mark,
             )
-            if mark is not None:
-                loss += outputs[mark].loss
-                if loss_dict is None:
-                    loss_dict = outputs[mark].loss_dict.detach().cpu()
-                else:
-                    for i in loss_dict:
-                        loss_dict[i] += outputs[mark].loss_dict[i].detach().cpu()
-            else:
-                loss = outputs.loss
-                loss_dict = outputs.loss_dict
-                for i in loss_dict:
-                    loss_dict[i] = loss_dict[i].detach().cpu()
+            # if mark is not None:
+            #     loss += outputs[mark].loss
+            #     if loss_dict is None:
+            #         loss_dict = outputs[mark].loss_dict.detach().cpu()
+            #     else:
+            #         for i in loss_dict:
+            #             loss_dict[i] += outputs[mark].loss_dict[i].detach().cpu()
+            # else:
+            loss = outputs.loss
+            loss_dict = outputs.loss_dict
+            for i in loss_dict:
+                loss_dict[i] = loss_dict[i].detach().cpu()
             if return_outputs:
                 return loss, loss_dict, outputs
             return loss, loss_dict
@@ -545,13 +551,20 @@ class DetrModel(L.LightningModule):
     def _common_step(self, batch):
         if "stage 1 + 2 + 3" in self.stage:
             temp = self.stage
+            # batch[0]["pixel_values"] = batch[0]["pixel_values"].cpu()
             n, _, _, _ = batch[0]["pixel_values"].shape
 
-            t = torch.no_grad
-            if self.lr_detr > 0.0000001:
-                t = EmptyContextManager
+            # print(batch[0]["labels"][2])
+            # for t in batch[0]["labels"]:
+            #     if "masks" in t:
+            #         t["masks"] = t["masks"].cpu()
+
+            t = EmptyContextManager
+            if "mask" in self.stage:
+                t = torch.no_grad
             # print("stage 1")
             with t():
+                # print("stage 1")
                 loss, loss_dict, output = self._common_step_stage1(
                     batch[0], 0, None, True
                 )
@@ -581,6 +594,7 @@ class DetrModel(L.LightningModule):
                 # edge_label = None
                 # if edge_label is None:
                 #     print("edge_label is None")
+                # print("stage 2")
                 loss2, loss_dict2, outputs = self.common_step_stage2(
                     x,
                     edge_index,
@@ -594,17 +608,17 @@ class DetrModel(L.LightningModule):
                 loss += loss2
                 self.stage = "stage mask"
 
-                img = batch[0]["pixel_values"][n // 2]
+                img = batch[0]["labels"][n // 2]["mask_input"]
 
-                c, w, h = img.shape
-                if c > 3:
-                    img = img[3:, :, :]
+                # print("img shape", img.shape)
+
+                # c, w, h = img.shape
+                # if c > 3:
+                #     img = img[3:, :, :]
 
                 embeds = outputs["embeddings"]
                 objects, _ = embeds.shape
                 obj_per_image = objects // n
-                masks = []
-                stage_2_embeds = []
                 sub_embeds = embeds[
                     (n // 2) * obj_per_image : (n // 2 + 1) * obj_per_image
                 ]
@@ -616,28 +630,38 @@ class DetrModel(L.LightningModule):
                 # t = retdict["masks"]
                 pick_from = torch.where((sub_box_masks > -1))[0]
                 boxes = outputs["box"]
+            # print("retdict", retdict["masks"].shape, pick_from)
+            # print(retdict["masks"])
 
             if len(pick_from) > 0:
                 if len(pick_from) <= self.num:
                     stage_2_embeds = sub_embeds[pick_from]
-                    pick_index = sub_box_masks[pick_from]
                     box = boxes[pick_from]
-                    masks = retdict["masks"][pick_index]
+                    masks = retdict["masks"]  # [pick_index]
                 else:
                     tensor = torch.arange(len(pick_from))
                     indices = torch.randperm(tensor.size(0))[: self.num]
                     selected = pick_from[indices]
                     stage_2_embeds = sub_embeds[selected]
                     box = boxes[selected]
-                    pick_index = sub_box_masks[selected]
-                    masks = retdict["masks"][pick_index]
-                num_masks = masks.sum(axis=[-1, -2, -3])
+                    # pick_index = sub_box_masks[selected]
+                    masks = retdict["masks"][indices]
+
+                # print(masks.shape)
+                # print("before sum", masks)
+                num_masks = masks.sum(axis=[1, 2, 3])
+                # print(num_masks)
                 num_masks = num_masks > 0
-                if num_masks.sum() > 0:
-                    stage_2_embeds = stage_2_embeds[num_masks]
+                # print(num_masks)
+                if num_masks.any():
                     masks = masks[num_masks]
+                    masks = masks.to(self.device)
+                    num_masks = num_masks.to(self.device)
+                    stage_2_embeds = stage_2_embeds[num_masks]
                     box = box[num_masks]
+
                     img = img.repeat(stage_2_embeds.shape[0], 1, 1, 1)
+                    # print("img shape", img.shape)
                     loss3, loss_dict3 = self.common_stage_mask(
                         img, stage_2_embeds, masks, True, box
                     )
@@ -699,6 +723,64 @@ class DetrModel(L.LightningModule):
             loss, loss_dict = self.common_stage_mask(
                 pixel_values, stage_2_embeds, pixel_mask, True, box=box
             )
+        elif "stage pretrain mask" in self.stage:
+            temp = self.stage
+            self.stage = "stage mask"
+            # print(batch[0].keys())
+
+            inputs = batch[0]["labels"][0]["mask_input"]
+
+            boxes = batch[0]["labels"][0]["boxes"]
+            b, _ = boxes.shape
+            stage_2_embeds = torch.zeros((b, 256)).to(self.device)
+            stage_2_embeds.requires_grad_(False)
+            pick_from = torch.arange(b).to(self.device)
+            pick_from.requires_grad_(False)
+            masks = batch[0]["labels"][0]["masks"]
+
+            if len(pick_from) > 0:
+                if len(pick_from) > self.num:
+                    # stage_2_embeds = stage_2_embeds[pick_from]
+                    # box = boxes[pick_from]
+                    # masks = retdict["masks"]  # [pick_index]
+                    # else:
+                    # tensor = torch.arange(len(pick_from))
+                    indices = torch.randperm(pick_from.size(0))[: self.num]
+                    # selected = pick_from[indices]
+                    stage_2_embeds = stage_2_embeds[indices]
+                    boxes = boxes[indices]
+                    # pick_index = sub_box_masks[selected]
+                    masks = masks[indices]
+
+                # print(masks.shape)
+                # print("before sum", masks)
+                num_masks = masks.sum(axis=[1, 2, 3])
+                # print(num_masks)
+                num_masks = num_masks > 0
+                # print(num_masks)
+                if num_masks.any():
+                    masks = masks[num_masks]
+                    masks = masks.to(self.device)
+                    num_masks = num_masks.to(self.device)
+                    stage_2_embeds = stage_2_embeds[num_masks]
+                    boxes = boxes[num_masks]
+
+                    img = inputs.repeat(stage_2_embeds.shape[0], 1, 1, 1)
+                    # print("img shape", img.shape)
+                    loss3, loss_dict3 = self.common_stage_mask(
+                        img, stage_2_embeds, masks, True, boxes
+                    )
+                    # loss += loss3
+                    # loss_dict2["mask_auroc"] = loss_dict3["mask_auroc"]
+                    loss = loss3
+                    loss_dict = loss_dict3
+            else:
+                loss = 0.0
+                loss_dict = {}
+                loss_dict["mask_auroc"] = np.nan
+
+            self.stage = temp  # "stage 1 + 2 + 3"
+            # loss_dict = loss_dict2
 
         return loss, loss_dict
 
