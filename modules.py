@@ -210,15 +210,18 @@ class DetrModel(L.LightningModule):
         output_dim,
         lr_detr=None,
         lr_backbone=None,
-        additional_input_dim=10,
+        gnn_in_channel=10,
         layer_type="GCNConv",
         dropout=True,
         scheduler_step=-1,
         warmup_epoches=1,
         pick_num=6,
         mask_alpha=0.8,
-        mask_in_channel=11,
-        mask_out_channel=5,
+        mask_in_channel=3,
+        mask_out_channel=1,
+        class_weights=None,
+        consistency_regularization_coef=0.5,
+        box_head="lora",
     ):
         super().__init__()
         if isinstance(model, dict):
@@ -231,6 +234,7 @@ class DetrModel(L.LightningModule):
         assert stage in [
             "stage 1",
             "stage 2",
+            "stage 1 mask",
             "stage 1 + 2",
             "stage 1 + 2 + 3",
             "stage 1 + 2 + 3 mask",
@@ -246,7 +250,9 @@ class DetrModel(L.LightningModule):
         self.weight_decay = weight_decay
         self.training_step_outputs = []
         self.val_step_outputs = []
-        self.additional_input_dim = additional_input_dim
+        self.gnn_in_channel = gnn_in_channel
+        self.feature_dim = feature_dim
+        self.box_head = box_head
 
         self.acc = torchmetrics.Accuracy(
             task="multiclass", num_classes=output_dim, average="macro"
@@ -258,14 +264,31 @@ class DetrModel(L.LightningModule):
 
         self.gnn = GCN(
             feature_dim,
-            additional_input_dim,
+            gnn_in_channel,
             output_dim,
             layer_type=layer_type,
             dropout=dropout,
+            box_head=box_head,
         )
-        t = torch.ones((output_dim))
-        t[-1] = 0.1
+        self.class_weights = class_weights
+        if class_weights is not None:
+            t = torch.tensor(class_weights, dtype=torch.float32)
+        else:
+            t = torch.ones((output_dim))
+            t[-1] = 0.1
+
+        self.class_weights = (t - t[-1]).numpy()  # - t[-1]
+
+        print("model with output classes", output_dim)
+        print("model receiving class weights", t)
+
         self.cri = nn.CrossEntropyLoss(weight=t)
+        self.edge_cri = nn.BCEWithLogitsLoss(reduction="none")
+        self.kv = nn.KLDivLoss(reduction="batchmean")
+
+        print("using consistency regularization coef", consistency_regularization_coef)
+        self.consistency_regularization_coef = consistency_regularization_coef
+
         self.output_dim = output_dim
         self.mask_head = VitForMask(
             embed_dim=feature_dim,
@@ -289,7 +312,7 @@ class DetrModel(L.LightningModule):
         pixel_mask=None,
         labels=None,
         mark=None,
-        stage_2_embeds=None,
+        embed=None,
         box=None,
     ):
         if "stage 1" in self.stage:
@@ -324,17 +347,17 @@ class DetrModel(L.LightningModule):
             return self.gnn(x, edge_index)
 
         elif "stage mask" in self.stage:
-            assert stage_2_embeds is not None
+            assert embed is not None
             assert pixel_values is not None
             if self.box_in_for_mask:
                 assert box is not None
                 return self.mask_head(
                     pixel_values,
-                    stage_2_embeds,
+                    embed,
                     box,  # .unsqueeze(1).repeat(1, self.num, 1),
                 )
             else:
-                return self.mask_head(pixel_values, stage_2_embeds)
+                return self.mask_head(pixel_values, embed)
 
         else:
             raise NotImplementedError
@@ -345,10 +368,7 @@ class DetrModel(L.LightningModule):
 
         return loss_bbox  # + 2 * loss_giou
 
-    def _common_step_stage1(self, batch, loss, loss_dict, return_outputs=False):
-        if batch is None:
-            return loss, loss_dict
-
+    def common_step_stage1(self, batch, return_outputs=False):
         if "stage 1" in self.stage:
 
             pixel_values = batch["pixel_values"]  # .to(self.device)
@@ -395,24 +415,12 @@ class DetrModel(L.LightningModule):
             loss_dict = outputs.loss_dict
             for i in loss_dict:
                 loss_dict[i] = loss_dict[i].detach().cpu()
+            loss_dict["loss"] = loss.detach().cpu()
             if return_outputs:
                 return loss, loss_dict, outputs
             return loss, loss_dict
-            return loss, loss_dict
         else:
             raise ValueError("not in stage 1")
-
-    def common_step_stage1(self, batch):
-        loss = 0
-        loss_dict = None
-        if isinstance(batch, list):
-            # print("list")
-            for i in batch:
-                loss, loss_dict = self._common_step_stage1(i, loss, loss_dict)
-        else:
-            loss, loss_dict = self._common_step_stage1(batch, loss, loss_dict)
-
-        return loss, {"loss": loss.detach().cpu()}
 
     def common_step_stage2(
         self,
@@ -424,6 +432,7 @@ class DetrModel(L.LightningModule):
         box_mask=None,
         edge_label=None,
         edge_mask=None,
+        edge_type=None,
         return_outputs=False,
     ):
 
@@ -435,8 +444,25 @@ class DetrModel(L.LightningModule):
         ret_dict = self(x=x, edge_index=edge)
         # print(ret_dict["predict"][mask].shape, y[mask].shape)
         # print(torch.max(y[mask]))
-
+        # print(ret_dict["predict"].shape)
+        # print(y)
         loss = self.cri(ret_dict["predict"][mask], y[mask])
+        if edge_type is not None and sum(edge_type) > 0:
+            # print(edge_type)
+            # print(edge_type)
+            # print(sum(edge_type))
+            inter_edge = (edge.T)[edge_type]
+            n1 = ret_dict["predict"][inter_edge[:, 0]]
+            n2 = ret_dict["predict"][inter_edge[:, 1]]
+            # print(n1.shape, n2.shape)
+            loss_consistency = self.kv(
+                torch.log_softmax(n1, dim=1),
+                torch.softmax(n2, dim=1),
+            ) + self.kv(
+                torch.log_softmax(n2, dim=1),
+                torch.softmax(n1, dim=1),
+            )
+            loss += self.consistency_regularization_coef * loss_consistency
         # self.auroc.update(ret_dict["predict"][mask].detach(), y[mask])
         # print("before auroc")
         loss_dict = {
@@ -460,36 +486,46 @@ class DetrModel(L.LightningModule):
         # print("before edge loss")
         if edge_label is not None:
             edge_label = edge_label.to(self.device)
-            if edge_mask is None:
-                edge_mask = torch.ones_like(edge_label, dtype=torch.bool)
-            loss_edge = F.binary_cross_entropy(
-                ret_dict["edge"].squeeze()[edge_mask], edge_label[edge_mask].float()
-            )
+            ret_dict["edge"] = ret_dict["edge"].to(self.device)
+            if edge_mask is not None:
+                # edge_mask = torch.ones_like(edge_label, dtype=torch.bool)
+                edge_mask = edge_mask.to(self.device)
+                ret_dict["edge"] = ret_dict["edge"][edge_mask]
+                edge_label = edge_label[edge_mask]
+            # print(
+            #     "shape before loss",
+            #     ret_dict["edge"].squeeze().shape,
+            #     edge_label.float().shape,
+            # )
+            edge_label = edge_label.float()
+            loss_edge = self.edge_cri(ret_dict["edge"].squeeze(), edge_label)
+            loss_edge = loss_edge * (edge_label + 0.1)
+            # print(loss_edge.shape)
+            loss_edge = loss_edge.mean()
+            # print(loss_edge.shape)
             loss += loss_edge
             loss_dict["loss_edge"] = loss_edge.detach().cpu()
         # print("after edge loss")
+
+        # print(loss, loss_dict)
 
         if return_outputs:
             return loss, loss_dict, ret_dict
         return loss, loss_dict
 
-    def common_stage_mask(
-        self, pixel_values, stage_2_embeds, mask, cal_auroc=False, box=None
-    ):
+    def common_stage_mask(self, pixel_values, embed, mask, cal_auroc=False, box=None):
         pixel_values = pixel_values.to(self.device).float()
-        stage_2_embeds = stage_2_embeds.to(self.device).float()
+        embed = embed.to(self.device).float()
         mask = mask.to(self.device).float()
-        outputs = self(
-            pixel_values=pixel_values, stage_2_embeds=stage_2_embeds, box=box
-        )
+        outputs = self(pixel_values=pixel_values, embed=embed, box=box)
         loss = sigmoid_focal_loss(outputs, mask.float(), alpha=self.mask_alpha)
         # print("after focal loss")
         if cal_auroc:
             auroc = self.mask_auroc(
-                outputs.detach().view(-1).cpu(), mask.detach().view(-1).cpu()
+                outputs.detach().view(-1), mask.detach().view(-1)
             ).cpu()
-            # self.mask_auroc.reset()
-            # torch.cuda.empty_cache()
+            self.mask_auroc.reset()
+            torch.cuda.empty_cache()
             return loss, {"loss": loss.detach().cpu(), "mask_auroc": auroc}
         # loss = F.binary_cross_entropy(outputs, mask.float())
         return loss, {"loss": loss.detach().cpu()}
@@ -497,7 +533,7 @@ class DetrModel(L.LightningModule):
     def on_validation_epoch_end(self):
         # loss = torch.stack(self.val_step_outputs).mean()
         losses = np.mean([i["loss"] for i in self.val_step_outputs])
-        if "stage mask" in self.stage or "stage 1 + 2 + 3" in self.stage:
+        if "mask" in self.stage or "stage 1 + 2 + 3" in self.stage:
             # auroc = self.mask_auroc.compute()
             auroc = np.nanmean(
                 [i["mask_auroc"] for i in self.val_step_outputs if "mask_auroc" in i]
@@ -513,14 +549,23 @@ class DetrModel(L.LightningModule):
                 [i["loss_boxes"] for i in self.val_step_outputs if "loss_boxes" in i]
             )
             self.log("total_validate_loss_boxes", loss_boxes, prog_bar=True)
-
+        if "loss_ce" in self.val_step_outputs[0]:
+            ce_loss = np.mean(
+                [i["loss_ce"] for i in self.val_step_outputs if "loss_ce" in i]
+            )
+            self.log("total_validate_loss_ce", ce_loss, prog_bar=True)
+        if "loss_bbox" in self.val_step_outputs[0]:
+            bbox_loss = np.mean(
+                [i["loss_bbox"] for i in self.val_step_outputs if "loss_bbox" in i]
+            )
+            self.log("total_validate_loss_bbox", bbox_loss, prog_bar=True)
         self.log("total_validate_loss", losses, prog_bar=True)
         self.val_step_outputs.clear()
 
     def on_train_epoch_end(self):
         # loss = torch.stack(self.val_step_outputs).mean()
         losses = np.mean([i["loss"] for i in self.training_step_outputs])
-        if "stage mask" in self.stage or "stage 1 + 2 + 3" in self.stage:
+        if "mask" in self.stage or "stage 1 + 2 + 3" in self.stage:
             auroc = np.nanmean(
                 [
                     i["mask_auroc"]
@@ -544,7 +589,6 @@ class DetrModel(L.LightningModule):
                 ]
             )
             self.log("total_train_loss_boxes", loss_boxes, prog_bar=True)
-
         self.log("total_train_loss", losses, prog_bar=True)
         self.training_step_outputs.clear()
 
@@ -565,9 +609,7 @@ class DetrModel(L.LightningModule):
             # print("stage 1")
             with t():
                 # print("stage 1")
-                loss, loss_dict, output = self._common_step_stage1(
-                    batch[0], 0, None, True
-                )
+                loss, loss_dict, output = self.common_step_stage1(batch[0], True)
                 # print("stage 2")
                 # print(batch[0]["labels"])
                 retdict = utils.process(
@@ -577,7 +619,7 @@ class DetrModel(L.LightningModule):
                     empty=self.output_dim - 1,
                 )
                 data2 = utils.convertStage2Dataset(
-                    retdict, num_classes=self.output_dim - 1
+                    retdict, num_classes=self.output_dim - 1, obj_thres=0.1
                 )
                 self.stage = "stage 2"
                 x = data2.x
@@ -586,11 +628,12 @@ class DetrModel(L.LightningModule):
                 mask = torch.ones_like(y, dtype=torch.bool)
                 boxes = data2.boxes  # if hasattr(data2, "boxes") else None
                 box_masks = data2.box_masks  # if hasattr(data2, "box_masks") else None
+                edge_type = data2.inter_edges if hasattr(data2, "inter_edges") else None
                 # if box_masks is not None:
                 #     box_masks = box_masks>-1
                 edge_label = (
-                    data2.edge_label
-                )  # if hasattr(batch, "edge_label") else None
+                    (data2.edge_label) if hasattr(batch, "edge_label") else None
+                )
                 # edge_label = None
                 # if edge_label is None:
                 #     print("edge_label is None")
@@ -604,17 +647,15 @@ class DetrModel(L.LightningModule):
                     box_masks > -1,
                     edge_label,
                     return_outputs=True,
+                    edge_type=edge_type,
                 )
                 loss += loss2
                 self.stage = "stage mask"
 
-                img = batch[0]["labels"][n // 2]["mask_input"]
-
-                # print("img shape", img.shape)
-
-                # c, w, h = img.shape
-                # if c > 3:
-                #     img = img[3:, :, :]
+                if "mask_input" in batch[0]["labels"][n // 2]:
+                    img = batch[0]["labels"][n // 2]["mask_input"]
+                else:
+                    img = batch[0]["pixel_values"][n // 2]
 
                 embeds = outputs["embeddings"]
                 objects, _ = embeds.shape
@@ -649,7 +690,8 @@ class DetrModel(L.LightningModule):
 
                 # print(masks.shape)
                 # print("before sum", masks)
-                num_masks = masks.sum(axis=[1, 2, 3])
+                masks = masks.squeeze(1)
+                num_masks = masks.sum(axis=[1, 2])
                 # print(num_masks)
                 num_masks = num_masks > 0
                 # print(num_masks)
@@ -667,16 +709,83 @@ class DetrModel(L.LightningModule):
                     )
                     loss += loss3
                     loss_dict2["mask_auroc"] = loss_dict3["mask_auroc"]
+                    loss_dict2["loss"] = loss.detach().cpu()
             else:
                 loss_dict2["mask_auroc"] = np.nan
 
             self.stage = temp  # "stage 1 + 2 + 3"
             loss_dict = loss_dict2
             # loss_dict["auroc_mask"] = loss_dict3["auroc"]
+        elif "stage 1 mask" in self.stage:
+            self.stage = "stage 1"
+
+            t = EmptyContextManager
+            if self.lr_detr < 1e-6:
+                t = torch.no_grad
+            with t():
+                loss, loss_dict, output = self.common_step_stage1(batch[0], True)
+                # print(output)
+                # print(loss_dict)
+                if "mask_input" in batch[0]["labels"][0]:
+                    img = batch[0]["labels"][0]["mask_input"]
+                else:
+                    img = batch[0]["pixel_values"][0]
+                retdict = utils.process_stage1(output, batch[0]["labels"])
+                masks = retdict["masks"]
+                boxes = retdict["pred_boxes"]
+                embeds = retdict["feature"]
+                obj_pos = retdict["obj_pos"]
+                label = retdict["label"]
+                label = label.cpu().numpy()
+                weights = self.class_weights[label]
+                picked = utils.unique_random_sample_indices(weights, self.num)
+                embeds = embeds[picked]
+                boxes = boxes[picked]
+                obj_pos = obj_pos[picked]
+                masks = masks[obj_pos]
+                self.stage = "stage mask"
+                if masks.dim() == 4:
+                    masks = masks.squeeze(1)
+                num_masks = masks.sum(axis=[1, 2])
+                num_masks = num_masks > 0
+
+            if num_masks.any():
+                masks = masks[num_masks]
+                # masks = masks.to(self.device)
+                # num_masks = num_masks.to(self.device)
+                embeds = embeds[num_masks]
+                boxes = boxes[num_masks]
+
+                img = img.repeat(embeds.shape[0], 1, 1, 1)
+                loss2, loss_dict2 = self.common_stage_mask(
+                    img, embeds, masks, True, boxes
+                )
+                if self.lr_detr < 1e-6:
+                    loss = loss2
+                else:
+                    loss = loss + loss2
+
+                if self.lr_detr < 1e-6:
+                    loss_dict = loss_dict2
+                else:
+                    loss_dict["mask_auroc"] = loss_dict2["mask_auroc"]
+                # print("loss dict stage mask", loss_dict)
+
+            self.stage = "stage 1 mask"
+
+            # print("loss dict", loss_dict)
+
+            # loss_dict = loss_dict2
+
         elif "stage 1 + 2" in self.stage:
-            loss, loss_dict, output = self._common_step_stage1(batch[0], 0, None, True)
-            retdict = utils.process(output, batch[0]["labels"])
-            data2 = utils.convertStage2Dataset(retdict)
+            loss, loss_dict, output = self.common_step_stage1(batch[0], True)
+            retdict = utils.process(
+                output, batch[0]["labels"], empty=self.output_dim - 1
+            )
+            # print("output dim ", self.output_dim)
+            data2 = utils.convertStage2Dataset(
+                retdict, obj_thres=0.1, num_classes=self.output_dim - 1
+            )
             self.stage = "stage 2"
             x = data2.x
             y = data2.y
@@ -684,18 +793,27 @@ class DetrModel(L.LightningModule):
             mask = torch.ones_like(y, dtype=torch.bool)
             boxes = data2.boxes if hasattr(data2, "boxes") else None
             box_masks = data2.box_masks if hasattr(data2, "box_masks") else None
-            edge_label = data2.edge_label  # if hasattr(batch, "edge_label") else None
+            # edge_label = data2.edge_label if hasattr(data2, "edge_label") else None
+            edge_type = data2.inter_edges if hasattr(data2, "inter_edges") else None
             edge_label = None
             # if edge_label is None:
             #     print("edge_label is None")
             loss2, loss_dict2 = self.common_step_stage2(
-                x, edge_index, mask, y, boxes, box_masks > -1, edge_label
+                x,
+                edge_index,
+                mask,
+                y,
+                boxes,
+                box_masks > -1,
+                edge_label,
+                edge_type=edge_type,
+                return_outputs=False,
             )
             self.stage = "stage 1 + 2"
             loss = loss + loss2
             loss_dict = loss_dict2
         elif "stage 1" in self.stage:
-            loss, loss_dict = self.common_step_stage1(batch)
+            loss, loss_dict = self.common_step_stage1(batch[0])
         elif "stage 2" in self.stage:
             mask = batch.train_mask
             y = batch.y
@@ -705,6 +823,7 @@ class DetrModel(L.LightningModule):
             edge_mask = (
                 batch.train_edge_mask if hasattr(batch, "train_edge_mask") else None
             )
+            edge_type = batch.inter_edges if hasattr(batch, "inter_edges") else None
             loss, loss_dict = self.common_step_stage2(
                 batch.x,
                 batch.edge_index,
@@ -714,6 +833,7 @@ class DetrModel(L.LightningModule):
                 box_masks,
                 edge_label,
                 edge_mask,
+                edge_type=edge_type,
             )
 
         elif "stage mask" in self.stage:
@@ -835,6 +955,78 @@ class DetrModel(L.LightningModule):
                     },
                 )
             optim = torch.optim.AdamW(param_dicts)
+
+        elif "stage 1 mask" in self.stage:
+            # if self.lr_backbone is not None:
+
+            d1 = []
+            d2 = []
+            d3 = []
+            for n, p in self.named_parameters():
+                if "backbone" in n and p.requires_grad:
+                    d1.append(p)
+                elif ".model" in n:
+                    d2.append(p)
+                elif "mask_head" in n:
+                    d3.append(p)
+            # self.lr_backbone = self.lr
+            param_dicts = []
+            if self.lr_backbone > 1e-6:
+                param_dicts.append({"params": d1, "lr": self.lr_backbone})
+            if self.lr_detr > 1e-6:
+                param_dicts.append(
+                    {
+                        "params": d2,
+                        "lr": self.lr_detr,
+                    }
+                )
+            if self.lr > 1e-6:
+                param_dicts.append(
+                    {
+                        "params": d3,
+                        "lr": self.lr,
+                    }
+                )
+            if self.weight_decay > 0:
+                optim = torch.optim.AdamW(param_dicts, weight_decay=self.weight_decay)
+            else:
+                optim = torch.optim.Adam(param_dicts)
+
+        elif "stage 1 + 2" in self.stage:
+            # if self.lr_backbone is not None:
+
+            d1 = []
+            d2 = []
+            d3 = []
+            for n, p in self.named_parameters():
+                if "backbone" in n and p.requires_grad:
+                    d1.append(p)
+                elif ".model" in n:
+                    d2.append(p)
+                elif "gnn" in n:
+                    d3.append(p)
+            # self.lr_backbone = self.lr
+            param_dicts = []
+            if self.lr_backbone > 1e-6:
+                param_dicts.append({"params": d1, "lr": self.lr_backbone})
+            if self.lr_detr > 1e-6:
+                param_dicts.append(
+                    {
+                        "params": d2,
+                        "lr": self.lr_detr,
+                    }
+                )
+            if self.lr > 1e-6:
+                param_dicts.append(
+                    {
+                        "params": d3,
+                        "lr": self.lr,
+                    }
+                )
+            if self.weight_decay > 0:
+                optim = torch.optim.AdamW(param_dicts, weight_decay=self.weight_decay)
+            else:
+                optim = torch.optim.Adam(param_dicts)
 
         elif "stage 1" in self.stage:
             if self.lr_backbone is not None:
@@ -985,6 +1177,7 @@ class GCN(torch.nn.Module):
         layer_type="GCNConv",
         dropout=False,
         zpos=100,
+        box_head="lora",
     ):
 
         super().__init__()
@@ -1028,12 +1221,21 @@ class GCN(torch.nn.Module):
         #     nn.ReLU(),
         #     LoRALayer(input_dim // 2, output_classes, 4),
         # )
-        self.box_head = nn.Sequential(
-            nn.Linear(input_dim, input_dim // 2),
-            nn.ReLU(),
-            LoRALayer(input_dim // 2, 4, 4),
-            nn.Tanh(),
-        )
+        self.box = box_head
+        if box_head == "lora":
+            self.box_head = nn.Sequential(
+                nn.Linear(input_dim, input_dim // 2),
+                nn.ReLU(),
+                LoRALayer(input_dim // 2, 4, 4),
+                nn.Tanh(),
+            )
+        else:
+            self.box_head = nn.Sequential(
+                nn.Linear(input_dim, input_dim // 2),
+                nn.ReLU(),
+                nn.Linear(input_dim // 2, 4),
+                nn.Sigmoid(),
+            )
 
         self.dropout = dropout
 
@@ -1094,7 +1296,10 @@ class GCN(torch.nn.Module):
         predict = self.cls_head(x)
         # predict[:, : self.output_classes - 1] += inputs[:, 5 : self.output_classes + 4]
 
-        box = self.box_head(x) + inputs[:, 1:5]
+        if self.box == "lora":
+            box = self.box_head(x) + inputs[:, 1:5]
+        else:
+            box = self.box_head(x)
 
         row, col = edge_index
         edge_embeddings = torch.cat([x[row], x[col]], dim=1)
@@ -1216,10 +1421,10 @@ class VitForMask(nn.Module):
         self.up5 = Up(64, 16, (400, 400), embed_dim)
 
         # 32 * 800 * 800
-        self.up6 = Up(32, 16, (800, 800), embed_dim)
+        self.up6 = Up(32, 32, (800, 800), embed_dim)
 
         # 1 * 800 * 800
-        self.outc = nn.Conv2d(16, c_out, kernel_size=1)
+        self.outc = nn.Conv2d(32, c_out, kernel_size=1)
 
         self.sigmoid = sigmoid
 

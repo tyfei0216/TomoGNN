@@ -1,4 +1,5 @@
 import json
+import multiprocessing
 import os
 import pickle
 import random
@@ -68,7 +69,7 @@ class stage2Dataset(Gdataset):
         seed (int): Random seed for reproducibility.
     """
 
-    def __init__(self, dataset_list, dataset_len, train_val=[0.8, 0.2], seed=1013):
+    def __init__(self, dataset_list, dataset_len, train_val=None, seed=1013):
         super().__init__()
         self.dataset_list = []
         self.dataset_len = dataset_len
@@ -76,20 +77,22 @@ class stage2Dataset(Gdataset):
         random.seed(seed)
         for i in dataset_list:
             a = list(range(i.x.shape[0]))
-            train = random.sample(a, int(len(a) * train_val[0]))
-            train_mask = torch.zeros(len(a), dtype=torch.bool)
-            train_mask[train] = True
+
+            train_mask = torch.ones(len(a), dtype=torch.bool)
+            if train_val is not None:
+                val = random.sample(a, int(len(a) * train_val[1]))
+                train_mask[val] = False
             val_mask = ~train_mask
             i.train_mask = train_mask
             i.val_mask = val_mask
-            if hasattr(i, "edge_label"):
-                edge_train_mask = torch.zeros(i.edge_label.shape[0], dtype=torch.bool)
-                train = random.sample(
-                    list(range(i.edge_label.shape[0])), int(len(a) * train_val[0])
-                )
-                edge_train_mask[train] = True
-                i.edge_train_mask = edge_train_mask
-                i.edge_val_mask = ~edge_train_mask
+            # if hasattr(i, "edge_label"):
+            #     edge_train_mask = torch.zeros(i.edge_label.shape[0], dtype=torch.bool)
+            #     train = random.sample(
+            #         list(range(i.edge_label.shape[0])), int(len(a) * train_val[0])
+            #     )
+            #     edge_train_mask[train] = True
+            #     i.edge_train_mask = edge_train_mask
+            #     i.edge_val_mask = ~edge_train_mask
             self.dataset_list.append(i)
 
     def len(self):
@@ -266,7 +269,7 @@ class CocoDetection(torchvision.datasets.vision.VisionDataset):
         add_classname=False,
         maxsize=800,
         norm="none",
-        filtermin=5,
+        filtermin=2,
     ):
         # annotation_file_path = os.path.join(image_directory_path, ANNOTATION_FILE_NAME)
         super().__init__(image_directory_path)
@@ -325,7 +328,7 @@ class CocoDetection(torchvision.datasets.vision.VisionDataset):
             return [], 0
         return t, pos
 
-    def processAnnotations(self, annotations, image):
+    def processAnnotations(self, annotations, image, require_mask=True):
         labels = torch.tensor(
             [sample["category_id"] for sample in annotations], dtype=torch.long
         )
@@ -359,7 +362,7 @@ class CocoDetection(torchvision.datasets.vision.VisionDataset):
             item_id = [sample["item_id"] for sample in annotations]
             retdict["item_id"] = item_id
 
-        if self.require_mask:
+        if self.require_mask and require_mask:
             masks = torch.stack(
                 [
                     torch.tensor(
@@ -412,7 +415,7 @@ class CocoDetection(torchvision.datasets.vision.VisionDataset):
 
         return image, target
 
-    def __getitem__(self, idx, seed=None):
+    def __getitem__(self, idx, seed=None, require_mask=True):
         # idx1 = idx
         # print("call item")
         if self.needids is not None:
@@ -425,7 +428,7 @@ class CocoDetection(torchvision.datasets.vision.VisionDataset):
         if len(annotation) == 0:
             raise ValueError
         image = torch.tensor(image)
-        target = self.processAnnotations(annotation, image)
+        target = self.processAnnotations(annotation, image, require_mask=require_mask)
 
         ori_class_labels = target["class_labels"].clone()
         target["class_labels"] = torch.tensor(
@@ -633,6 +636,7 @@ class MrcDataset(Dataset):
         mask_input_channels=11,
         add_classname=False,
         filtermin=5,
+        use_ori=True,
     ):
         with open(annotation_path, "rb") as f:
             self.annotation = pickle.load(f)
@@ -645,6 +649,8 @@ class MrcDataset(Dataset):
             self.map_class = self.annotation["mapclass"]
         else:
             self.map_class = map_class
+
+        print("dataset map classes: ", self.map_class)
 
         self.transform = transform
         self.mrc_shape = self.annotation["mrc_shape"]
@@ -664,7 +670,10 @@ class MrcDataset(Dataset):
 
         self._filter_ids()
 
-        self.lock = threading.Lock()
+        self.use_ori = use_ori
+
+        # self.lock = threading.Lock()
+        self.lock = multiprocessing.Lock()
 
     def _filter_ids(self):
         needids = []
@@ -691,11 +700,14 @@ class MrcDataset(Dataset):
             dtype=np.float32,
         )
         img[1] = self.ori_mrc[index]
-        img[0] = np.mean(self.ori_mrc[max(0, index - self.length_for_average) : index])
+        img[0] = np.mean(
+            self.ori_mrc[max(0, index - self.length_for_average) : index], axis=0
+        )
         img[2] = np.mean(
             self.ori_mrc[
                 index + 1 : min(index + self.length_for_average + 1, len(self.ori_mrc))
-            ]
+            ],
+            axis=0,
         )
         if self.norm == "zscore":
             for i in range(3):
@@ -704,7 +716,11 @@ class MrcDataset(Dataset):
             for i in range(3):
                 img[i] = exposure.equalize_hist(img[i])
 
-        if self.mask_input_channels > 0 and require_mask:
+        if (
+            self.mask_input_channels > 0
+            and require_mask
+            and (self.mask_input_channels != 3 or not self.use_ori)
+        ):
             m = np.zeros(
                 (
                     self.mask_input_channels,
@@ -741,17 +757,13 @@ class MrcDataset(Dataset):
         item_id = []
         for j in self.map_class:
             t = self.annotation["annotations"][j].get(index, [])
+            # print(t)
             for i in t:
                 item_id.append(j + "_" + str(i))
                 labels.append(self.map_class[j])
                 names.append(j)
                 bboxes.append(self.annotation["bboxes"][j][index][i])
                 if require_mask:
-                    # for _ in range(self.mask_length - 1):
-                    #     item_id.append(j + "_" + str(i))
-                    #     labels.append(self.mapclass[j])
-                    #     names.append(j)
-                    #     bboxes.append(self.annotation["bboxes"][j][index][i])
                     m = np.zeros(
                         (
                             self.mask_length,
@@ -765,6 +777,7 @@ class MrcDataset(Dataset):
                         if mm is not None:
                             m[k + self.mask_length // 2] = (mm == i).toarray()
                     masks.append(m)
+            # print(len(names), item_id)
 
         bboxes = torch.tensor(bboxes, dtype=torch.float32)
         bt = torchvision.ops.box_convert(bboxes, "xywh", "xyxy")
@@ -780,17 +793,20 @@ class MrcDataset(Dataset):
 
         if len(item_id) > 0:
             ret["item_id"] = item_id
-
+        # print(ret)
         return ret
 
-    def _getitem(self, index, offset=0, require_mask=False):
-        idx = np.min(self.needids) + index * self.gap + offset
+    def _getitem(self, index, offset=0, require_mask=False, pos=None):
+        if pos is not None:
+            idx = pos
+        else:
+            idx = np.min(self.needids) + index * self.gap + offset
         img = self._get_slice(idx, require_mask=require_mask)
         # img = torch.tensor(img, dtype=torch.float32)
         target = self._get_annotations(idx, require_mask)
         return img, target, idx
 
-    def __getitem__(self, idx, seed=None, offset=0, require_mask=True):
+    def __getitem__(self, idx=0, seed=None, offset=0, require_mask=True, pos=None):
         # idx1 = idx
         # print("call item")
         # if self.needids is not None:
@@ -799,7 +815,7 @@ class MrcDataset(Dataset):
 
         require_mask = self.require_mask & require_mask
 
-        image, target, zpos = self._getitem(idx, offset, require_mask)
+        image, target, zpos = self._getitem(idx, offset, require_mask, pos)
 
         # print(idx1, idx, len(annotation))
         if len(target) == 0:
@@ -810,19 +826,20 @@ class MrcDataset(Dataset):
         target["class_labels"] = torch.tensor(
             range(len(target["class_labels"])), dtype=torch.long
         )
-
+        # print("cl", target["class_labels"])
         if seed is not None:
             with self.lock:
+                # print(f"getting {zpos} with seed {seed}")
                 random.seed(seed)
                 np.random.seed(seed)
                 torch.manual_seed(seed)
                 if self.transform is not None:
                     image, target = self.transform(image, target)
+                # print("cl", target["class_labels"])
         else:
-
             if self.transform is not None:
                 image, target = self.transform(image, target)
-
+            # print("cl2", target["class_labels"])
         c, h, w = image.shape
         target["orig_size"] = torch.tensor((h, w))
         if h > self.maxsize or w > self.maxsize:
@@ -834,12 +851,13 @@ class MrcDataset(Dataset):
             temp = transforms.Compose(
                 [
                     transforms.Resize((int(r * h), int(r * w))),
-                    transforms.SanitizeBoundingBoxes(),
+                    # transforms.SanitizeBoundingBoxes(),
                 ]
             )
             image, target = temp(image, target)
             h = int(r * h)
             w = int(r * w)
+            # print("cl3", target["class_labels"])
 
         target["size"] = torch.tensor((h, w))
 
@@ -897,8 +915,11 @@ class MrcDataset(Dataset):
 
         if require_mask:
             # print(image.shape)
-            target["mask_input"] = image[3:]
-            image = image[:3]
+            if self.mask_input_channels == 3 and self.use_ori:
+                target["mask_input"] = image
+            else:
+                target["mask_input"] = image[3:]
+                image = image[:3]
 
         ret = {
             "pixel_values": image,
@@ -911,7 +932,7 @@ class MrcDataset(Dataset):
 class MrcDataset2(MrcDataset):
     def __init__(self, num, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        print("using batch size ", num)
+        print("using %d slices for one graph" % num)
         self.num = num
         self.seed = 42
 
@@ -923,10 +944,12 @@ class MrcDataset2(MrcDataset):
         with self.lock:
             self.seed = self.seed + 1
             seed = self.seed
+            # print("create seed", seed)
         res = []
         num = self.num
         offset = random.randint(0, self.gap - 1)
         offset -= self.gap // 2
+        # offset = 0
         for i in range(num):
             if i == num // 2:
                 res.append(
@@ -961,7 +984,7 @@ class MrcDataModule(L.LightningDataModule):
                 collate_fn=self.stack_batch,
                 batch_size=self.train_batch_size,
                 shuffle=True,
-                num_workers=4,
+                num_workers=8,
             )
 
         train_sets = []
@@ -972,7 +995,7 @@ class MrcDataModule(L.LightningDataModule):
                     collate_fn=self.stack_batch,
                     batch_size=self.train_batch_size,
                     shuffle=True,
-                    num_workers=4,
+                    num_workers=8,
                 )
             )
         return CombinedLoader(
@@ -988,7 +1011,7 @@ class MrcDataModule(L.LightningDataModule):
                 collate_fn=self.stack_batch,
                 batch_size=self.val_batch_size,
                 shuffle=False,
-                num_workers=4,
+                num_workers=8,
             )
 
         val_sets = []
@@ -999,7 +1022,7 @@ class MrcDataModule(L.LightningDataModule):
                     collate_fn=self.stack_batch,
                     batch_size=self.val_batch_size,
                     shuffle=False,
-                    num_workers=4,
+                    num_workers=8,
                 )
             )
         return CombinedLoader(
@@ -1096,17 +1119,28 @@ class TestDatasetMrc(Dataset):
     def __len__(self):
         return (len(self.ori_mrc) + self.gap - 1) // self.gap
 
-    def __getitem__(self, index):
+    def __getitem__(self, index=None, pos=None):
+        if index is None and pos is None:
+            raise ValueError("Either index or pos must be provided.")
         img = np.zeros(
             (3, self.ori_mrc.shape[1], self.ori_mrc.shape[2]), dtype=np.float32
         )
-        idx = index * self.gap
+        if pos is not None:
+            idx = pos
+        else:
+            idx = index * self.gap
+        # if idx is None:
+        #     idx = index * self.gap
+
         img[1] = self.ori_mrc[idx]
-        img[0] = np.mean(self.ori_mrc[max(0, idx - self.length_for_average) : idx])
+        img[0] = np.mean(
+            self.ori_mrc[max(0, idx - self.length_for_average) : idx], axis=0
+        )
         img[2] = np.mean(
             self.ori_mrc[
                 idx + 1 : min(idx + self.length_for_average + 1, len(self.ori_mrc))
-            ]
+            ],
+            axis=0,
         )
         img[np.isnan(img)] = 0.0
         if self.norm == "zscore":
@@ -1125,8 +1159,13 @@ class TestDatasetMrc(Dataset):
             wq = w if w < self.reshape else self.reshape
             wq = wq / w
             r = min(hq, wq)
-            t = transforms.Compose([transforms.Resize((int(r * h), int(r * w)))])
-            image = t(img)
+            # print(r, (int(r * h), int(r * w)))
+            # print(img.shape)
+            trans = transforms.Resize((int(r * h), int(r * w)))
+            # print(trans)
+            # print(img.shape)
+            img = trans(img)
+            # print(img.shape)
             h = int(r * h)
             w = int(r * w)
 
@@ -1136,10 +1175,10 @@ class TestDatasetMrc(Dataset):
         padtransform = transforms.Pad(
             (0, 0, self.reshape - w, self.reshape - h), fill=0
         )
-        image = padtransform(image)
+        img = padtransform(img)
 
         return {
-            "pixel_values": torch.tensor(image),
+            "pixel_values": torch.tensor(img),
             "pixel_mask": torch.tensor(mask),
             "labels": {"pos": idx, "zposmax": 500, "class_labels": None},
         }
@@ -1272,11 +1311,11 @@ def getDefaultTransform():
         [
             transforms.ToDtype(torch.float32, scale=True),
             # transforms.Normalize(mean=[0, 0, 0], std=[1, 1, 1], inplace=True),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.5),
             transforms.RandomResize(600, 1000),
             # transforms.Lambda(lambda x:torch.clamp(x, min=-4.0, max=4.0)),
             transforms.RandomIoUCrop(min_scale=0.8),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomVerticalFlip(p=0.5),
             transforms.SanitizeBoundingBoxes(min_size=5),
         ]
     )
@@ -1330,6 +1369,12 @@ def get_stage12_dataset(configs):
 
     if "num" not in configs["data"]:
         configs["data"]["num"] = 5
+
+    if "train_batch_size" not in configs["training"]:
+        configs["training"]["train_batch_size"] = 1
+
+    if "val_batch_size" not in configs["training"]:
+        configs["training"]["val_batch_size"] = 1
 
     # dataset = modules.CocoDetection(
     #     configs["image_path"],
@@ -1443,6 +1488,12 @@ def get_stage12_dataset_mrc(configs):
 
     if "mask_out_channel" in configs["model"]:
         configs["data"]["mask_length"] = configs["model"]["mask_out_channel"]
+
+    if "train_batch_size" not in configs["training"]:
+        configs["training"]["train_batch_size"] = 1
+
+    if "val_batch_size" not in configs["training"]:
+        configs["training"]["val_batch_size"] = 1
 
     # dataset = modules.CocoDetection(
     #     configs["image_path"],

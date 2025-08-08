@@ -84,7 +84,7 @@ def run():
     monitor = (
         "total_validate_loss"
         if configs["model"]["stage"] != "stage 2"
-        else "validate_auroc"
+        else "total_validate_loss"
     )
 
     if configs["model"]["stage"] == "stage mask":
@@ -95,7 +95,7 @@ def run():
     filename = (
         "{epoch}-{total_validate_loss:.4f}"
         if configs["model"]["stage"] != "stage 2"
-        else "{epoch}-{validate_loss:.4f}-{validate_auroc:.4f}"
+        else "{epoch}-{total_validate_loss:.4f}-{total_validate_auroc:.4f}"
     )
     if configs["model"]["stage"] == "stage mask":
         filename = "{epoch}-{total_validate_mask_auroc:.4f}"
@@ -149,6 +149,7 @@ def run():
         devices=args.devices,
         accelerator="gpu",
         max_epochs=configs["training"]["epochs"],
+        # val_check_interval=1000,
         gradient_clip_val=configs["training"]["gradient_clip_val"],
         accumulate_grad_batches=configs["training"]["accumulate_grad_batches"],
         log_every_n_steps=configs["training"]["log_every_n_steps"],
