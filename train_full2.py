@@ -48,7 +48,7 @@ def run():
     if not os.path.exists(os.path.join(args.path, "stage1")):
         os.mkdir(os.path.join(args.path, "stage1"))
         os.mkdir(os.path.join(args.path, "stage2"))
-        os.mkdir(os.path.join(args.path, "stage3"))
+        # os.mkdir(os.path.join(args.path, "stage3"))
 
     L.seed_everything(configs["seed"])
 
@@ -154,7 +154,7 @@ def run():
         # CHECKPOINT = "facebook/detr-resnet-50"
         # image_processor = DetrImageProcessor.from_pretrained(CHECKPOINT)
         configs["data"]["transform"] = "default"
-        configs["data"]["num"] = 9
+        configs["data"]["num"] = 15
         configs["data"]["norm"] = "hist"
         configs["data"]["require_mask"] = False
 
@@ -165,8 +165,8 @@ def run():
 
         model.stage = "stage 1 + 2"
         model.scheduler_step = configs["training"]["epochs"][1]
-        model.lr_backbone = 1e-5
-        model.lr_detr = 1e-5
+        model.lr_backbone = 0.0
+        model.lr_detr = 0.0
         name = configs["training"]["name"] + "_stage2"
         logger = TensorBoardLogger(logger_path, name=name)
 
@@ -213,68 +213,68 @@ def run():
     else:
         print("skip training stage 2")
 
-    model = utils.pickAndLoadBest(model, os.path.join(args.path, "stage2"))
+    # model = utils.pickAndLoadBest(model, os.path.join(args.path, "stage2"))
 
-    print("loading dataset")
-    # CHECKPOINT = "facebook/detr-resnet-50"
-    # image_processor = DetrImageProcessor.from_pretrained(CHECKPOINT)
-    configs["data"]["transform"] = "default"
-    configs["data"]["num"] = 1
-    configs["data"]["norm"] = "hist"
-    configs["data"]["require_mask"] = True
+    # print("loading dataset")
+    # # CHECKPOINT = "facebook/detr-resnet-50"
+    # # image_processor = DetrImageProcessor.from_pretrained(CHECKPOINT)
+    # configs["data"]["transform"] = "default"
+    # configs["data"]["num"] = 1
+    # configs["data"]["norm"] = "hist"
+    # configs["data"]["require_mask"] = True
 
-    if "mrc" in configs["data"]:
-        ds = data.get_stage12_dataset_mrc(configs)
+    # if "mrc" in configs["data"]:
+    #     ds = data.get_stage12_dataset_mrc(configs)
 
-    print("finish loading data")
+    # print("finish loading data")
 
-    model.stage = "stage 1 mask"
-    model.scheduler_step = configs["training"]["epochs"][2]
-    model.lr_backbone = 0.0
-    model.lr_detr = 0.0
-    name = configs["training"]["name"] + "_stage3"
-    logger = TensorBoardLogger(logger_path, name=name)
+    # model.stage = "stage 1 mask"
+    # model.scheduler_step = configs["training"]["epochs"][2]
+    # model.lr_backbone = 0.0
+    # model.lr_detr = 0.0
+    # name = configs["training"]["name"] + "_stage3"
+    # logger = TensorBoardLogger(logger_path, name=name)
 
-    checkpoint_callback = ModelCheckpoint(
-        monitor=monitor,  # Replace with your validation metric
-        mode="min",  # 'min' if the metric should be minimized (e.g., loss), 'max' for maximization (e.g., accuracy)
-        save_top_k=3,  # Save top k checkpoints based on the monitored metric
-        save_last=True,  # Save the last checkpoint at the end of training
-        dirpath=os.path.join(
-            args.path, "stage3"
-        ),  # Directory where the checkpoints will be saved
-        filename=filename,  # Checkpoint file naming pattern
-    )
+    # checkpoint_callback = ModelCheckpoint(
+    #     monitor=monitor,  # Replace with your validation metric
+    #     mode="min",  # 'min' if the metric should be minimized (e.g., loss), 'max' for maximization (e.g., accuracy)
+    #     save_top_k=3,  # Save top k checkpoints based on the monitored metric
+    #     save_last=True,  # Save the last checkpoint at the end of training
+    #     dirpath=os.path.join(
+    #         args.path, "stage3"
+    #     ),  # Directory where the checkpoints will be saved
+    #     filename=filename,  # Checkpoint file naming pattern
+    # )
 
-    checkpoint_callback2 = ModelCheckpoint(
-        every_n_epochs=10,
-        save_top_k=-1,
-        save_last=False,  # Save the last checkpoint at the end of training
-        dirpath=os.path.join(
-            args.path, "stage3"
-        ),  # Directory where the checkpoints will be saved
-        filename=filename,  # Checkpoint file naming pattern
-    )
+    # checkpoint_callback2 = ModelCheckpoint(
+    #     every_n_epochs=10,
+    #     save_top_k=-1,
+    #     save_last=False,  # Save the last checkpoint at the end of training
+    #     dirpath=os.path.join(
+    #         args.path, "stage3"
+    #     ),  # Directory where the checkpoints will be saved
+    #     filename=filename,  # Checkpoint file naming pattern
+    # )
 
-    trainer = Trainer(
-        logger=logger,
-        devices=args.devices,
-        accelerator="gpu",
-        max_epochs=configs["training"]["epochs"][2],
-        # val_check_interval=1000,
-        gradient_clip_val=configs["training"]["gradient_clip_val"],
-        accumulate_grad_batches=8,
-        log_every_n_steps=5,
-        callbacks=[checkpoint_callback, checkpoint_callback2],
-        strategy=args.strategy,
-    )
+    # trainer = Trainer(
+    #     logger=logger,
+    #     devices=args.devices,
+    #     accelerator="gpu",
+    #     max_epochs=configs["training"]["epochs"][2],
+    #     # val_check_interval=1000,
+    #     gradient_clip_val=configs["training"]["gradient_clip_val"],
+    #     accumulate_grad_batches=8,
+    #     log_every_n_steps=5,
+    #     callbacks=[checkpoint_callback, checkpoint_callback2],
+    #     strategy=args.strategy,
+    # )
 
-    print("start training stage 3")
-    # if args.checkpoint is not None:
-    #     trainer.fit(model, ds, ckpt_path=args.checkpoint)
-    # else:
-    trainer.fit(model, ds)
-    print("finish training stage 3")
+    # print("start training stage 3")
+    # # if args.checkpoint is not None:
+    # #     trainer.fit(model, ds, ckpt_path=args.checkpoint)
+    # # else:
+    # trainer.fit(model, ds)
+    # print("finish training stage 3")
 
 
 if __name__ == "__main__":

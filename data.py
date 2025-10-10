@@ -78,13 +78,15 @@ class stage2Dataset(Gdataset):
         for i in dataset_list:
             a = list(range(i.x.shape[0]))
 
-            train_mask = torch.ones(len(a), dtype=torch.bool)
-            if train_val is not None:
-                val = random.sample(a, int(len(a) * train_val[1]))
-                train_mask[val] = False
-            val_mask = ~train_mask
-            i.train_mask = train_mask
-            i.val_mask = val_mask
+            if not hasattr(i, "train_mask"):
+
+                train_mask = torch.ones(len(a), dtype=torch.bool)
+                if train_val is not None:
+                    val = random.sample(a, int(len(a) * train_val[1]))
+                    train_mask[val] = False
+                val_mask = ~train_mask
+                i.train_mask = train_mask
+                i.val_mask = val_mask
             # if hasattr(i, "edge_label"):
             #     edge_train_mask = torch.zeros(i.edge_label.shape[0], dtype=torch.bool)
             #     train = random.sample(
@@ -638,6 +640,7 @@ class MrcDataset(Dataset):
         filtermin=5,
         use_ori=True,
     ):
+        print("reading dataset:", annotation_path)
         with open(annotation_path, "rb") as f:
             self.annotation = pickle.load(f)
 
@@ -675,6 +678,8 @@ class MrcDataset(Dataset):
         # self.lock = threading.Lock()
         self.lock = multiprocessing.Lock()
 
+        print("dataset length:", len(self))
+
     def _filter_ids(self):
         needids = []
         for i in range(self.mrc_shape[0]):
@@ -683,15 +688,30 @@ class MrcDataset(Dataset):
                 cnt += len(self.annotation["annotations"][j].get(i, []))
             if cnt > self.filtermin:
                 needids.append(i)
+        # print(len(needids))
         self.needids = needids
+        self.start_pos = np.min(self.needids)
+        self.end_pos = np.max(self.needids) + 1
 
     def __len__(self):
         if not hasattr(self, "needids"):
             self._filter_ids()
 
+        if hasattr(self, "idx"):
+            if len(self.idx) > 0:
+                return len(self.idx)
+
         t = np.max(self.needids) - np.min(self.needids)
 
-        num = (t + self.gap) // self.gap
+        if self.gap > 0:
+            self.idx = []
+            for i in range(np.min(self.needids), np.max(self.needids) + 1, self.gap):
+                if i in self.needids:
+                    self.idx.append(i)
+            num = len(self.idx)
+            # num = (t + self.gap) // self.gap
+        else:
+            num = len(self.needids)
         return num
 
     def _get_slice(self, index, require_mask=False):
@@ -700,21 +720,33 @@ class MrcDataset(Dataset):
             dtype=np.float32,
         )
         img[1] = self.ori_mrc[index]
-        img[0] = np.mean(
-            self.ori_mrc[max(0, index - self.length_for_average) : index], axis=0
-        )
-        img[2] = np.mean(
-            self.ori_mrc[
-                index + 1 : min(index + self.length_for_average + 1, len(self.ori_mrc))
-            ],
-            axis=0,
-        )
+        if max(0, index - self.length_for_average) < index:
+            img[0] = np.mean(
+                self.ori_mrc[max(0, index - self.length_for_average) : index], axis=0
+            )
+        else:
+            img[0] = self.ori_mrc[index]
+        if index + 1 < min(index + self.length_for_average + 1, len(self.ori_mrc)):
+
+            img[2] = np.mean(
+                self.ori_mrc[
+                    index
+                    + 1 : min(index + self.length_for_average + 1, len(self.ori_mrc))
+                ],
+                axis=0,
+            )
+        else:
+            img[2] = self.ori_mrc[index]
+
         if self.norm == "zscore":
             for i in range(3):
-                img[i] = (img[i] - img[i].mean()) / img[i].std()
+                img[i] = (img[i] - img[i].mean()) / (img[i].std() + 1e-6)
+
         elif self.norm == "hist":
+            # print("before hist")
             for i in range(3):
                 img[i] = exposure.equalize_hist(img[i])
+            # print("after hist")
 
         if (
             self.mask_input_channels > 0
@@ -780,12 +812,20 @@ class MrcDataset(Dataset):
             # print(len(names), item_id)
 
         bboxes = torch.tensor(bboxes, dtype=torch.float32)
+        if bboxes.dim() < 2:
+            bboxes = bboxes.view(-1, 4)
         bt = torchvision.ops.box_convert(bboxes, "xywh", "xyxy")
         boxes = BoundingBoxes(bt, format="xyxy", canvas_size=self.mrc_shape[1:])
         ret = {"bboxes": boxes, "class_labels": torch.tensor(labels, dtype=torch.long)}
         if require_mask:
-            masks = torch.stack([torch.tensor(m) for m in masks], dim=0)
-            masks = Mask(masks)
+            if len(masks) == 0:
+                masks = torch.zeros(
+                    (0, self.mask_length, self.mrc_shape[1], self.mrc_shape[2]),
+                    dtype=torch.bool,
+                )
+            else:
+                masks = torch.stack([torch.tensor(m) for m in masks], dim=0)
+                masks = Mask(masks)
             ret["masks"] = masks
 
         if self.add_classname:
@@ -800,8 +840,19 @@ class MrcDataset(Dataset):
         if pos is not None:
             idx = pos
         else:
-            idx = np.min(self.needids) + index * self.gap + offset
-        img = self._get_slice(idx, require_mask=require_mask)
+            if self.gap > 0:
+                idx = self.idx[index] + offset
+            else:
+                idx = self.needids[index] + offset
+
+            if idx < 0:
+                idx = 0
+            if idx >= self.mrc_shape[0]:
+                idx = self.mrc_shape[0] - 1
+
+            idx = min(self.needids, key=lambda x: abs(x - idx))
+
+        img = self._get_slice(idx, require_mask)
         # img = torch.tensor(img, dtype=torch.float32)
         target = self._get_annotations(idx, require_mask)
         return img, target, idx
@@ -937,7 +988,7 @@ class MrcDataset2(MrcDataset):
         self.seed = 42
 
     def __len__(self):
-        return super().__len__() - self.num + 1
+        return super().__len__()
 
     def __getitem__(self, idx):
         # could cause chaos between different workers, but doesn't matter
@@ -947,17 +998,24 @@ class MrcDataset2(MrcDataset):
             # print("create seed", seed)
         res = []
         num = self.num
-        offset = random.randint(0, self.gap - 1)
-        offset -= self.gap // 2
+        if self.gap > 0:
+            offset = random.randint(0, self.gap - 1)
+            offset -= self.gap // 2
+        else:
+            offset = 0
         # offset = 0
+        if self.gap > 0:
+            gap = self.gap
+        else:
+            gap = 1
         for i in range(num):
             if i == num // 2:
-                res.append(
-                    super().__getitem__(idx + i, seed, offset, require_mask=True)
-                )
+                res.append(super().__getitem__(idx, seed, offset, require_mask=True))
             else:
                 res.append(
-                    super().__getitem__(idx + i, seed, offset, require_mask=False)
+                    super().__getitem__(
+                        idx, seed, offset + (i - num // 2) * gap, require_mask=False
+                    )
                 )
         return stackBatch(res)
 
@@ -1108,6 +1166,7 @@ class TestDatasetMrc(Dataset):
     def __init__(
         self, mrc_path, norm="hist", reshape=800, gap=5, length_for_average=10
     ):
+        print("test dataset")
         self.mrc_path = mrc_path
         self.ori_mrc = utils.readTomogram(mrc_path)
 
@@ -1116,10 +1175,13 @@ class TestDatasetMrc(Dataset):
         self.gap = gap
         self.length_for_average = length_for_average
 
+        self.start_pos = 0
+        self.end_pos = len(self.ori_mrc)
+
     def __len__(self):
         return (len(self.ori_mrc) + self.gap - 1) // self.gap
 
-    def __getitem__(self, index=None, pos=None):
+    def __getitem__(self, index=None, pos=None, offset=0):
         if index is None and pos is None:
             raise ValueError("Either index or pos must be provided.")
         img = np.zeros(
@@ -1129,19 +1191,27 @@ class TestDatasetMrc(Dataset):
             idx = pos
         else:
             idx = index * self.gap
+        idx += offset
         # if idx is None:
         #     idx = index * self.gap
 
         img[1] = self.ori_mrc[idx]
-        img[0] = np.mean(
-            self.ori_mrc[max(0, idx - self.length_for_average) : idx], axis=0
-        )
-        img[2] = np.mean(
-            self.ori_mrc[
-                idx + 1 : min(idx + self.length_for_average + 1, len(self.ori_mrc))
-            ],
-            axis=0,
-        )
+        if max(0, idx - self.length_for_average) < idx:
+            img[0] = np.mean(
+                self.ori_mrc[max(0, idx - self.length_for_average) : idx], axis=0
+            )
+        else:
+            img[0] = self.ori_mrc[idx]
+        if idx + 1 < min(idx + self.length_for_average + 1, len(self.ori_mrc)):
+
+            img[2] = np.mean(
+                self.ori_mrc[
+                    idx + 1 : min(idx + self.length_for_average + 1, len(self.ori_mrc))
+                ],
+                axis=0,
+            )
+        else:
+            img[2] = self.ori_mrc[idx]
         img[np.isnan(img)] = 0.0
         if self.norm == "zscore":
             for i in range(3):
@@ -1152,6 +1222,8 @@ class TestDatasetMrc(Dataset):
                     img[i] = exposure.equalize_hist(img[i])
 
         c, h, w = img.shape
+
+        img = torch.tensor(img, dtype=torch.float32)
 
         if h > self.reshape or w > self.reshape:
             hq = h if h < self.reshape else self.reshape
@@ -1164,6 +1236,7 @@ class TestDatasetMrc(Dataset):
             trans = transforms.Resize((int(r * h), int(r * w)))
             # print(trans)
             # print(img.shape)
+
             img = trans(img)
             # print(img.shape)
             h = int(r * h)
@@ -1177,9 +1250,15 @@ class TestDatasetMrc(Dataset):
         )
         img = padtransform(img)
 
+        if not isinstance(img, torch.Tensor):
+            img = torch.tensor(img)
+
+        if not isinstance(mask, torch.Tensor):
+            mask = torch.tensor(mask)
+
         return {
-            "pixel_values": torch.tensor(img),
-            "pixel_mask": torch.tensor(mask),
+            "pixel_values": img,
+            "pixel_mask": mask,
             "labels": {"pos": idx, "zposmax": 500, "class_labels": None},
         }
 
@@ -1495,6 +1574,15 @@ def get_stage12_dataset_mrc(configs):
     if "val_batch_size" not in configs["training"]:
         configs["training"]["val_batch_size"] = 1
 
+    if "gap" not in configs["data"]:
+        configs["data"]["gap"] = 5
+
+    if "length_for_average" not in configs["data"]:
+        configs["data"]["length_for_average"] = 10
+
+    if "filtermin" not in configs["data"]:
+        configs["data"]["filtermin"] = 3
+
     # dataset = modules.CocoDetection(
     #     configs["image_path"],
     #     configs["annotation_path"],
@@ -1515,10 +1603,13 @@ def get_stage12_dataset_mrc(configs):
                     i,
                     transform=t,
                     require_mask=configs["data"]["require_mask"],
+                    gap=configs["data"]["gap"],
                     norm=configs["data"]["norm"],
                     map_class=map_class,
                     mask_input_channels=configs["data"]["mask_input_channels"],
                     mask_length=configs["data"]["mask_length"],
+                    length_for_average=configs["data"]["length_for_average"],
+                    filtermin=configs["data"]["filtermin"],
                 )
             )
         train_sets = torch.utils.data.ConcatDataset(train_sets)
@@ -1530,11 +1621,14 @@ def get_stage12_dataset_mrc(configs):
             configs["data"]["num"],
             configs["data"]["annotation_path_train"],
             transform=t,
+            gap=configs["data"]["gap"],
             require_mask=configs["data"]["require_mask"],
             norm=configs["data"]["norm"],
             map_class=map_class,
             mask_input_channels=configs["data"]["mask_input_channels"],
             mask_length=configs["data"]["mask_length"],
+            length_for_average=configs["data"]["length_for_average"],
+            filtermin=configs["data"]["filtermin"],
         )
 
     if isinstance(configs["data"]["annotation_path_val"], list):
@@ -1550,22 +1644,31 @@ def get_stage12_dataset_mrc(configs):
                     transform=t,
                     require_mask=configs["data"]["require_mask"],
                     norm=configs["data"]["norm"],
+                    gap=configs["data"]["gap"],
                     map_class=map_class,
                     mask_input_channels=configs["data"]["mask_input_channels"],
                     mask_length=configs["data"]["mask_length"],
+                    length_for_average=configs["data"]["length_for_average"],
+                    filtermin=configs["data"]["filtermin"],
                 )
             )
         val_sets = torch.utils.data.ConcatDataset(val_sets)
     else:
+        map_class = None
+        if "map_class" in configs["data"]:
+            map_class = configs["data"]["map_class"]
         val_sets = MrcDataset2(
             configs["data"]["num"],
             configs["data"]["annotation_path_val"],
             transform=t,
             require_mask=configs["data"]["require_mask"],
             norm=configs["data"]["norm"],
+            gap=configs["data"]["gap"],
             map_class=map_class,
             mask_input_channels=configs["data"]["mask_input_channels"],
             mask_length=configs["data"]["mask_length"],
+            length_for_average=configs["data"]["length_for_average"],
+            filtermin=configs["data"]["filtermin"],
         )
 
     ds = MrcDataModule(

@@ -1,6 +1,8 @@
 import json
 import os
+import pickle
 import random
+import re
 from typing import List
 
 import mrcfile
@@ -76,13 +78,28 @@ def drawannotation(image, target, box=True, mask=True, font_size=30):
         annotated_tensor = draw_bounding_boxes(
             image=annotated_tensor,
             boxes=target["bboxes"],
-            labels=target["names"] if "names" in target else target["labels"],
-            font_size=font_size,
+            # labels=target["names"] if "names" in target else target["labels"],
+            # font_size=font_size,
             width=5,
             # colors=[int_colors[i] for i in target["class_labels"]],
         )
+
     res = annotated_tensor.numpy()
     plt.imshow(np.moveaxis(res, 0, -1))
+    for i in range(len(target["bboxes"])):
+        box = target["bboxes"][i]
+        if "names" in target:
+            name = target["names"][i]
+        else:
+            name = str(target["labels"][i])
+        plt.text(
+            box[0] + 10,
+            box[1] + 10,
+            name,
+            color="red",
+            fontsize=font_size,
+            # bbox=dict(facecolor="red", alpha=0.5),
+        )
 
 
 def mask_iou(mask1, mask2):
@@ -272,9 +289,10 @@ def processSingle(model, label, data, target_size, thres, has_none, empty=5):
     l = []
     item_ids = []
     masks = []
+    model.eval()
     output = model(
-        pixel_values=data["pixel_values"].unsqueeze(0).float(),
-        pixel_mask=data["pixel_mask"].unsqueeze(0).float(),
+        pixel_values=data["pixel_values"].unsqueeze(0).float().to(model.device),
+        pixel_mask=data["pixel_mask"].unsqueeze(0).float().to(model.device),
     )
     # for idx, i in enumerate(model_names):
     #     # print(i)
@@ -298,6 +316,9 @@ def processSingle(model, label, data, target_size, thres, has_none, empty=5):
         reserve = reserve > thres
         reserve = reserve.any(dim=1)
 
+    if label["class_labels"] is not None and len(label["class_labels"]) == 0:
+        label["class_labels"] = None
+
     if label["class_labels"] is not None:
         o = {}
         o["pred_boxes"] = pred_boxes.unsqueeze(0)
@@ -307,7 +328,7 @@ def processSingle(model, label, data, target_size, thres, has_none, empty=5):
         r = torch.zeros_like(reserve, dtype=torch.bool)
         r[match_res[0]] = True
         reserve2 = reserve | r
-        print("check whether reserve ", sum(reserve), sum(reserve2))
+        # print("check whether reserve ", sum(reserve), sum(reserve2))
         reserve = reserve2
     # else:
     #     reserve = v > thres
@@ -320,7 +341,11 @@ def processSingle(model, label, data, target_size, thres, has_none, empty=5):
 
     pos = torch.zeros((pred_boxes.shape[0], 5))
     pos[:, 0] = label["pos"]
+    # if label["pos"] > 249 and label["pos"] < 255:
+    #     print(label["pos"])
     if "zposmax" in label:
+        if label["zposmax"] == 0:
+            label["zposmax"] = 500
         pos[:, 0] /= label["zposmax"]
     else:
         pos[:, 0] /= 500
@@ -357,7 +382,7 @@ def processSingle(model, label, data, target_size, thres, has_none, empty=5):
 
             boxes[match_res[0]] = target_boxes
             box_mask[match_res[0]] = True
-            print(box_mask.shape, boxes.shape)
+            # print(box_mask.shape, boxes.shape)
             targets[match_res[0]] = target
 
             if "masks" in label:
@@ -383,6 +408,8 @@ def buildStage2(
     dataset,
     target_size,
     thres,
+    offset=0,
+    gap=5,
     # model_names=["other", "ribo"],
     has_none=False,
     empty=5,
@@ -409,12 +436,12 @@ def buildStage2(
         "sample_mapping": sample_mapping,
     }
     cnts = 0
-    for i in range(len(dataset)):
-        print("slice", i)
+    for i in tqdm(range(dataset.start_pos + offset, dataset.end_pos, gap)):
+        # print("slice", i)
         if seed is not None:
-            data = dataset.__getitem__(i, seed=seed)
+            data = dataset.__getitem__(pos=i, seed=seed)
         else:
-            data = dataset.__getitem__(i)
+            data = dataset.__getitem__(pos=i)
         label = data["labels"]
         with torch.no_grad():
             _ret_dict = processSingle(
@@ -431,8 +458,8 @@ def buildStage2(
                 sample_mapping[cnts] = len(ret_dict["images"]) - 1
                 cnts += 1
 
-        print("obj_cnts:", cnts)
-
+        # print("obj_cnts:", cnts)
+    print("finish dataset")
     ret_dict["feature"] = torch.cat(ret_dict["feature"], dim=0)
     ret_dict["label"] = torch.cat(ret_dict["label"], dim=0)
     ret_dict["box_mask"] = torch.cat(ret_dict["box_mask"], dim=0)
@@ -451,12 +478,19 @@ def buildStage2(
 
 
 def process_stage1(outputs, labels):
-    match_res = matcher(outputs, labels)
     logits = outputs["logits"]
     device = logits.device
+    for l in range(len(labels)):
+        for i in ["class_labels", "boxes", "masks"]:
+            labels[l][i] = labels[l][i].to(device)
+
+    match_res = matcher(outputs, labels)
+
     _, num_obj, obj_num = logits.shape
     pred_boxes = outputs["pred_boxes"]
     label = labels[0]
+    # print(label)
+    # print(label.keys())
     embed = outputs["last_hidden_state"][0]
     targets = torch.zeros((num_obj), dtype=torch.long).to(device)
     targets.fill_(obj_num)
@@ -633,15 +667,20 @@ def get_iou(X):
 
 
 def get_neighbors(
-    X, z_thres1=0.03, z_thres2=0.5, iou_thres=0.4, num_classes=4, obj_thres=0.2
+    X, z_thres1=0.021, z_thres2=0.5, iou_thres=0.4, num_classes=4, obj_thres=0.2
 ):
     X2 = X[:, 1:5].clone()
     # expand a little so that boxes may overlap
-    X2[:, 2:] += 0.05
-
+    # X2[:, 2:] += 0.05
+    # print("calculate node iou")
+    # with open("/home/feity/cryoem/temp/results/iou.pt", "wb") as f:
+    #     pickle.dump(X2, f)
     iou, _ = modules.box_iou(center_to_corners_format(X2), center_to_corners_format(X2))
-
-    obj = X[:, 5 : 5 + num_classes] > obj_thres
+    # print("calculate node iou done")
+    obj = X[:, 5 : 5 + num_classes]
+    # print(obj)
+    obj = torch.sigmoid(obj)  # .float()
+    obj = obj > obj_thres
     obj = obj.any(dim=1)
 
     iou -= 1 - obj.float()
@@ -703,7 +742,7 @@ def get_neighbors(
 
 
 def convertStage2Dataset(
-    retdict, z_thres1=0.01, z_thres2=0.1, iou_thres=0.4, num_classes=4, obj_thres=0.2
+    retdict, z_thres1=0.0021, z_thres2=0.1, iou_thres=0.4, num_classes=4, obj_thres=0.2
 ):
     X = retdict["feature"]
 
@@ -754,6 +793,7 @@ def convertStage2Dataset(
     t.inter_edges = edge_type
     t.box_masks = box_masks
     t.boxes = boxes
+    t.item_id = item_ids
     # t.edge_label = edge_label  # torch.tensor(edge_label, dtype=torch.long)
     # if "sample_mapping" in retdict:
     #     t.sample_mapping = torch.tensor(
@@ -952,6 +992,9 @@ def buildModel(configs, args, checkpoint=None):
 
 def getModel(configs):
 
+    if "stage" not in configs["model"]:
+        configs["model"]["stage"] = "stage 1"
+
     if "checkpoint" not in configs["model"]:
         configs["model"]["checkpoint"] = None
 
@@ -1012,6 +1055,12 @@ def getModel(configs):
             configs["model"]["feature_dim"] + configs["model"]["output_dim"] + 4
         )
     # print(configs["model"]["feature_dim"], configs["model"]["C_in"])
+
+    if "lr" not in configs["training"]:
+        configs["training"]["lr"] = 1e-4
+
+    if "weight_decay" not in configs["training"]:
+        configs["training"]["weight_decay"] = 0.0
 
     model = modules.DetrModel(
         configs["model"]["stage"],
@@ -1349,3 +1398,29 @@ def cal_ap(df, target_df, iou_thresholds=[0.5, 0.75]):
 def readTomogram(filename):
     with mrcfile.open(filename, permissive=True) as m:
         return m.data
+
+
+def pickAndLoadBest(model, path):
+    pattern = re.compile(
+        r"epoch=(\d+)"
+        r"(?:-total_validate_auroc=([0-9.]+))?"
+        r"-total_validate_loss=([0-9.]+)"
+        r"(?:-v(\d+))?"
+        r"\.ckpt$"
+    )
+    for i in os.listdir(path):
+        best = ""
+        loss_best = 1e100
+        if i.endswith(".ckpt"):
+            m = pattern.match(i)
+            if m is not None:
+                epoch = int(m.group(1))
+                auroc = float(m.group(2)) if m.group(2) is not None else 0
+                loss = float(m.group(3))
+                v = int(m.group(4)) if m.group(4) is not None else 0
+                if loss_best > loss:
+                    loss_best = loss
+                    best = i
+    a = torch.load(os.path.join(path, best), map_location="cpu")["state_dict"]
+    model.load_state_dict(a, strict=False)
+    return model

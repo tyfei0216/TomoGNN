@@ -1,20 +1,156 @@
+import io
+import sys
+
 import cv2
 import numpy as np
 import pandas as pd
 import torch
-from scipy.ndimage import gaussian_filter
+import torchvision
+from scipy.ndimage import center_of_mass, gaussian_filter, gaussian_filter1d
+from scipy.optimize import linear_sum_assignment
+from scipy.spatial.distance import cdist
 from sklearn.cluster import DBSCAN
+from sklearn.metrics import (
+    auc,
+    average_precision_score,
+    precision_recall_curve,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 
 import utils
 
 
-def getLabels(
-    subdf, min_samples=3, eps=0.4, dis_penalty_coef=1.0, dis_penalty_cutoff=2.0
+def generatedf(
+    model,
+    dataset,
+    gap,
+    columns,
+    has_none=False,
+    empty=4,
+    num_classes=4,
+    z_multiply=500,
+    filter_prob=0.05,
+    return_mask=False,
 ):
-    # print(min_samples, eps, dis_penalty_coef, dis_penalty_cutoff)
+    # silence dubugging outputs
+    # saved_stdout = sys.stdout
+    # sys.stdout = io.StringIO()
+    t = [
+        "z",
+        "x",
+        "y",
+        "w",
+        "h",
+    ]
+    t.extend(columns)
+    with torch.no_grad():
+        alldfs = []
+        graphs = []
+        all_masks = []
+        for i in range(gap):
+            model.stage = "stage 1"
+            retdict = utils.buildStage2(
+                model,
+                dataset,
+                (800, 800),
+                filter_prob,
+                gap=gap,
+                offset=i,
+                has_none=has_none,
+                empty=empty,
+            )
+            if return_mask:
+                all_masks.append(retdict["masks"])
+            graph = utils.convertStage2Dataset(
+                retdict, num_classes=num_classes, obj_thres=0.1
+            )
+            print("build graph")
+            graphs.append(graph)
+            model.stage = "stage 2"
+            res = model(graph.x, graph.edge_index)
+            # embeds.append(res["embeddings"].cpu().numpy())
+            z = graph.x[:, [0]] * z_multiply
+            # z = z.long()
+            prob = torch.softmax(res["predict"], 1)
+            pred_boxes = res["box"]
+            print("prepare df")
+            df = torch.cat([z, pred_boxes, prob], 1)
+            df = df.numpy()
+            df = pd.DataFrame(df, columns=t)
+            df["z"] = df["z"].round(0).astype(int)
+            # df["z"] = df["z"].astype(int)
+            subdf = df[columns]
+            df["max"] = subdf.max(axis=1)
+            df["largest"] = subdf.idxmax(axis=1)
+            alldfs.append(df)
+    # sys.stdout = saved_stdout
+    # embeds = np.concatenate(embeds, 0)
+    alldfs = pd.concat(alldfs, ignore_index=True)
+    if return_mask:
+        all_masks = torch.cat(all_masks, 0)
+        return alldfs, graphs, all_masks.detach().cpu().numpy()
+    return alldfs, graphs
+
+
+def myscan(iou_matrix, zpos, eps=0.6, max_z_diff=2):
+    num = iou_matrix.shape[0]
+    # print(zpos, max_z_diff)
+    labels = -1 * np.ones(num, dtype=int)
+    current_label = 1
+    max_pos = np.max(zpos)
+    for i in range(num):
+        if labels[i] != -1:
+            continue
+        current = i
+        while True:
+            labels[current] = current_label
+            ifbreak = True
+            # print(
+            #     zpos[current] + 1, min(int(zpos[current] + max_z_diff + 1), max_pos + 1)
+            # )
+            for z in range(
+                zpos[current] + 1, min(int(zpos[current] + max_z_diff + 1), max_pos + 1)
+            ):
+                neighbors = np.where((zpos == z) & (iou_matrix[current] < eps))[0]
+                # print(neighbors)
+                # break
+                if len(neighbors) == 0:
+                    continue
+                neighbors = neighbors[labels[neighbors] == -1]
+                # print(neighbors)
+                if len(neighbors) == 0:
+                    continue
+                get_id = np.argmin(iou_matrix[current][neighbors])
+                current = neighbors[get_id]
+                ifbreak = False
+                break
+            if ifbreak:
+                break
+        current_label += 1
+    return labels
+
+
+def getLabels(
+    subdf,
+    min_samples=3,
+    eps=0.4,
+    dis_penalty_coef=1.0,
+    dis_penalty_cutoff=2.0,
+    enlarge=0.0,
+    use_myscan=False,
+):
+    print(min_samples, eps, dis_penalty_coef, dis_penalty_cutoff)
     # print("df len", len(subdf))
     hdb = DBSCAN(min_samples=min_samples, eps=eps, metric="precomputed")
-    iou = utils.get_iou(subdf[["x", "y", "w", "h"]].values)
+    # subdf = subdf.sort_values(by="z")
+    # zpos = subdf["z"].values
+
+    x = subdf[["x", "y", "w", "h"]].values
+    if enlarge > 0.0:
+        x[:, 2:] += enlarge
+    iou = utils.get_iou(x)
     iou = 1 - iou
     mask = subdf["z"].values
     dis_penalty = np.abs(mask[:, None] - mask[None, :]).astype(np.float32)
@@ -28,6 +164,8 @@ def getLabels(
     # print(dis_penalty, dis_penalty_coef)
     dis_penalty *= dis_penalty_coef
     iou = iou + dis_penalty
+    if use_myscan:
+        return myscan(iou, subdf["z"].values, eps=eps, max_z_diff=dis_penalty_cutoff)
     hdb.fit(iou)
     # print(iou)
     return hdb.labels_
@@ -37,29 +175,50 @@ def getLabels(
 # np.unique(hdb.labels_).tolist()
 
 
-def processClass(df, classname, min_prob, nms, dbscan_prams={}):
-    df["class_value"] = df[classname] * 2 - df["max"]
+def processClass(
+    df,
+    classname,
+    min_prob,
+    nms,
+    max_area=None,
+    min_area=None,
+    dbscan_prams={},
+    use_myscan=False,
+):
+    df["class_value"] = df[classname]  # * 2 - df["max"]
     subdf = df[df["class_value"] > min_prob]
     subdf = subdf[subdf["unlabeled"]]
     # print(len(subdf))
     # print(utils.convertBoxes(torch.tensor(subdf[["x", "y", "w", "h"]].values)).shape)
     alldfs = []
     for i, r in subdf.groupby("z"):
-        keep = utils.bbnms(
-            nms,
+        # keep = utils.bbnms(
+        #     nms,
+        #     utils.convertBoxes(torch.tensor(r[["x", "y", "w", "h"]].values)),
+        #     torch.tensor(r["class_value"].values),
+        #     np.array(["same" for i in range(len(r))]),
+        # )
+        keep = torchvision.ops.nms(
             utils.convertBoxes(torch.tensor(r[["x", "y", "w", "h"]].values)),
             torch.tensor(r["class_value"].values),
-            np.array(["same" for i in range(len(r))]),
+            nms,
         )
+        # if i == 190:
+        #     print("keep", keep)
         r["bbnms"] = False
-        r.loc[r.index[keep.numpy()], "bbnms"] = True
+        # print(keep, list(r.columns))
+        r.iloc[keep.numpy(), list(r.columns).index("bbnms")] = True
         r = r[r["bbnms"]]
         alldfs.append(r)
+    if len(alldfs) == 0:
+        return None
     subdf = pd.concat(alldfs)
-    # print(subdf)
-    # print(len(subdf), "after bbnms")
-    # print(dbscan_prams)
-    labels = getLabels(subdf, **dbscan_prams)
+    subdf["area"] = subdf["w"] * subdf["h"]
+    if max_area is not None:
+        subdf = subdf[subdf["area"] < max_area]
+    if min_area is not None:
+        subdf = subdf[subdf["area"] > min_area]
+    labels = getLabels(subdf, use_myscan=use_myscan, **dbscan_prams)
     print("number of instances in class ", len(np.unique(labels)))
     subdf["label"] = list(labels)
     return subdf
@@ -71,7 +230,42 @@ def findClosestIndex(lst, target):
     return closest_index
 
 
-def markFilter(df, classname, targetdf, max_cnt=100, remove_iou=0.5):
+def max_sum_subarray_position(arr, k):
+    if k > len(arr):
+        return None  # k is too large
+
+    # Compute sum of first window
+    window_sum = sum(arr[:k])
+    max_sum = window_sum
+    max_start_index = 0
+
+    # Slide the window
+    for i in range(k, len(arr)):
+        window_sum += arr[i] - arr[i - k]  # Add new element, remove old
+        if window_sum > max_sum:
+            max_sum = window_sum
+            max_start_index = i - k + 1
+
+    return max_start_index
+
+
+def markFilter(
+    df,
+    classname,
+    targetdf,
+    max_cnt=100,
+    remove_iou=0.5,
+    min_samples=10,
+    max_samples=500,
+    min_length=16,
+    extend=0,
+    threshold=0.2,
+):
+    if targetdf is None:
+        print("targetdf is None, skip")
+        return df
+    zpos_min = targetdf["z"].min()
+    zpos_max = targetdf["z"].max()
     label = []
     weight = []
     for i, r in targetdf.groupby("label"):
@@ -85,9 +279,29 @@ def markFilter(df, classname, targetdf, max_cnt=100, remove_iou=0.5):
     required_label = label[k]
     for label in required_label:
         subdf2 = targetdf[targetdf["label"] == label]
-        df.loc[subdf2.index, "label_id"] = label
-        df.loc[subdf2.index, "label"] = classname
-        for i in range(np.min(subdf2["z"]), np.max(subdf2["z"]) + 5, 5):
+        if len(subdf2) < min_samples:
+            continue
+        if len(subdf2) > max_samples:
+            pos = max_sum_subarray_position(list(subdf2[classname]), max_samples)
+            subdf2 = subdf2.iloc[pos : pos + max_samples]
+        # df.loc[subdf2.index, "label_id"] = label
+        # df.loc[subdf2.index, "label"] = classname
+
+        zmin = subdf2["z"].min()
+        zmax = subdf2["z"].max()
+        zmid = (zmin + zmax) // 2
+
+        if zmin > zmid - min_length:
+            zmin = zmid - min_length
+        if zmax < zmid + min_length:
+            zmax = zmid + min_length
+
+        zmin -= extend
+        zmax += extend
+        zmin = max(zmin, zpos_min)
+        zmax = min(zmax, zpos_max)
+
+        for i in range(zmin, zmax + 1):
             j = findClosestIndex(subdf2["z"].values, i)
             # print(i, j)
             posz_df = df[df["z"] == i]
@@ -97,8 +311,16 @@ def markFilter(df, classname, targetdf, max_cnt=100, remove_iou=0.5):
             iou = utils.get_iou(required_df[["x", "y", "w", "h"]].values)
             iou = iou[-1]
             iou = iou > remove_iou
+            iou[-1] = False
             required_df = required_df[iou]
+
             df.loc[required_df.index, "unlabeled"] = False
+            required_df = required_df.sort_values(by=classname, ascending=False)
+            if len(required_df) == 0:
+                continue
+            if required_df.iloc[0][classname] > threshold:
+                df.loc[required_df.index[0], "label_id"] = label
+                df.loc[required_df.index[0], "label"] = classname
 
 
 def pickTopCountors(countors, n, min_threshold):
@@ -122,6 +344,43 @@ def pickTopCountors(countors, n, min_threshold):
     return [item for item, weight in selected_items]
 
 
+def refineMembMask(
+    mask,
+    threshold,
+    sigma=0,
+    kernal_size=3,
+    morph_open_iterations=2,
+    morph_close_iterations=1,
+    **kwargs
+):
+    if sigma > 0:
+        mask = gaussian_filter(mask, sigma=sigma)
+    # Step 1: Convert to binary
+    binary_mask = (mask > threshold).astype(np.uint8) * 255
+
+    # Step 2: Apply morphological operations
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernal_size))
+    opened_mask = cv2.morphologyEx(
+        binary_mask, cv2.MORPH_OPEN, kernel, iterations=morph_open_iterations
+    )
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernal_size, 1))
+    opened_mask = cv2.morphologyEx(
+        opened_mask, cv2.MORPH_OPEN, kernel, iterations=morph_open_iterations
+    )
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernal_size, 1))
+    closed_mask = cv2.morphologyEx(
+        opened_mask, cv2.MORPH_CLOSE, kernel, iterations=morph_close_iterations
+    )
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernal_size))
+    closed_mask = cv2.morphologyEx(
+        opened_mask, cv2.MORPH_CLOSE, kernel, iterations=morph_close_iterations
+    )
+
+    return closed_mask
+
+
 def refineMask(
     mask,
     threshold=0.5,
@@ -129,16 +388,21 @@ def refineMask(
     morph_open_iterations=2,
     morph_close_kernal_size=(5, 5),
     morph_close_iterations=2,
+    apply_blur=True,
     blur_ksize=(15, 15),
     blur_sigma=0,
     contour_area_threshold=50,
     max_contours=1,
     apply_contours=True,
     apply_convex_hull=False,
+    **kwargs
 ):
     # Step 1: Convert to binary
     binary_mask = (mask > threshold).astype(np.uint8) * 255
     # _, binary_mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+
+    if np.sum(binary_mask) < 5:
+        return binary_mask
 
     # Step 2: Apply morphological operations
     kernel = np.ones(morph_open_kernal_size, np.uint8)
@@ -151,7 +415,10 @@ def refineMask(
     )
 
     # Step 3: Smooth edges
-    blurred_mask = cv2.GaussianBlur(closed_mask, blur_ksize, blur_sigma)
+    if apply_blur:
+        blurred_mask = cv2.GaussianBlur(closed_mask, blur_ksize, blur_sigma)
+    else:
+        blurred_mask = closed_mask
 
     if not apply_contours:
         return blurred_mask
@@ -176,19 +443,19 @@ def refineMask(
     return hull_mask
 
 
-def getMaskInputs(
+# get the embeddings and the boxes both from GNN
+# make sure the model is trained in the correct way to use this function
+def getMaskInputsStage2(
     df,
-    model,
     dataset,
-    class_id,
     min_length,
     extend,
-    stage1_outputs={},
+    res=None,
     zpos_min=0,
     zpos_max=500,
     iou_thres=0.5,
+    class_id=None,
 ):
-    model.stage = "stage 1"
     df = df.sort_values(by="z")
     zmin = df["z"].min() - 2
     zmax = df["z"].max() + 2
@@ -212,38 +479,118 @@ def getMaskInputs(
             df.iloc[q][["x", "y", "w", "h"]].astype(float).values
         ).unsqueeze(0)
         q = df.index[q]
+        inputs[i]["embed"] = res["embeddings"][q].detach().cpu().unsqueeze(0)
+
+        # boxes = stage1_outputs[i]["pred_boxes"]
+        # boxes = np.concatenate([inputs[i]["bboxes"], boxes], 0)
+        # iou = utils.get_iou(boxes)
+        # iou = iou[0, 1:]
+        # score = stage1_outputs[i]["prob"][:, class_id]
+        # score[iou < iou_thres] -= 1.0
+        # score = score + iou
+        # take_id = np.argmax(score)
+
+        # inputs[i]["embed"] = res["embeddings"][q].detach().cpu().unsqueeze(0)
+        # inputs[i]["embed"] = stage1_outputs[i]["embeddings"][[take_id]]
+        # print(data["pixel_values"].shape)
+        inputs[i]["input_mask"] = xywh2mask(
+            inputs[i]["bboxes"].squeeze().numpy(),
+            (inputs[i]["image"].shape[2], inputs[i]["image"].shape[3]),
+        )
+        # print(sum(inputs[i]["input_mask"].flatten()))
+
+    return inputs
+
+
+# def getMaskInputFromStage1()
+
+
+# the default version
+# the box comes from GNN, but the embeds comes from Detr.
+def getMaskInputs(
+    df,
+    model,
+    dataset,
+    class_id,
+    min_length,
+    extend,
+    stage1_outputs={},
+    zpos_min=0,
+    zpos_max=500,
+    iou_thres=0.5,
+    box_stage_1=False,
+    expand=0.0,
+):
+    model.stage = "stage 1"
+    df = df.sort_values(by="z")
+    zmin = df["z"].min()
+    zmax = df["z"].max()
+    zmid = (zmin + zmax) // 2
+    if zmin > zmid - min_length:
+        zmin = zmid - min_length
+    if zmax < zmid + min_length:
+        zmax = zmid + min_length
+    zmin -= extend
+    zmax += extend
+    zmin = max(zmin, zpos_min)
+    zmax = min(zmax, zpos_max - 1)
+    inputs = {}
+    # print("get output")
+    for i in range(zmin, zmax + 1):
+        inputs[i] = {}
+
         if i not in stage1_outputs:
             with torch.no_grad():
-                # data = dataset2.__getitem__(pos=i)
+                data = dataset.__getitem__(pos=i)
                 data["pixel_values"] = (
                     data["pixel_values"].unsqueeze(0).float().to(model.device)
                 )
                 data["pixel_mask"] = (
                     data["pixel_mask"].unsqueeze(0).float().to(model.device)
                 )
+                # print("get input image")
                 outputs = model(
                     pixel_values=data["pixel_values"],
                     pixel_mask=data["pixel_mask"],
                 )
+
             stage1_outputs[i] = {}
-            stage1_outputs[i]["pred_boxes"] = (
-                outputs["pred_boxes"].cpu().squeeze(0).numpy()
-            )
+            stage1_outputs[i]["pixel_values"] = data["pixel_values"].cpu()
+            stage1_outputs[i]["pred_boxes"] = outputs["pred_boxes"].cpu().squeeze()
             logits = outputs["logits"].squeeze(0)
             prob = torch.sigmoid(logits)
             stage1_outputs[i]["prob"] = prob.cpu().numpy()
             stage1_outputs[i]["embeddings"] = (
                 outputs["last_hidden_state"].cpu().squeeze(0)
             )
-
+        # print("get inputs")
+        # data = dataset.__getitem__(pos=i)
+        # t = data["pixel_values"].unsqueeze(0)
+        inputs[i]["image"] = stage1_outputs[i]["pixel_values"]
+        q = findClosestIndex(df["z"].values, i)
+        inputs[i]["bboxes"] = torch.tensor(
+            df.iloc[q][["x", "y", "w", "h"]].astype(float).values
+        ).unsqueeze(0)
+        if expand > 0.0:
+            inputs[i]["bboxes"] = inputs[i]["bboxes"].clone()
+            inputs[i]["bboxes"][:, 2:] += expand
+            inputs[i]["bboxes"][:, 2:] = np.minimum(inputs[i]["bboxes"][:, 2:], 1.0)
+            inputs[i]["bboxes"][:, 2:] = np.maximum(inputs[i]["bboxes"][:, 2:], 0.0)
+        q = df.index[q]
         boxes = stage1_outputs[i]["pred_boxes"]
+        # print(boxes.shape, inputs[i]["bboxes"].shape)
         boxes = np.concatenate([inputs[i]["bboxes"], boxes], 0)
+        # print("get iou")
         iou = utils.get_iou(boxes)
         iou = iou[0, 1:]
         score = stage1_outputs[i]["prob"][:, class_id]
         score[iou < iou_thres] -= 1.0
         score = score + iou
+
         take_id = np.argmax(score)
+
+        if box_stage_1:
+            inputs[i]["bboxes"] = stage1_outputs[i]["pred_boxes"][[take_id]]
 
         # inputs[i]["embed"] = res["embeddings"][q].detach().cpu().unsqueeze(0)
         inputs[i]["embed"] = stage1_outputs[i]["embeddings"][[take_id]]
@@ -257,7 +604,7 @@ def getMaskInputs(
     return inputs, stage1_outputs
 
 
-def getMasks(model, inputs, sigma=1):
+def getMasks(model, inputs, sigma=1, on_z_only=False):
     model.stage = "stage mask"
     masks = {}
     for i in inputs:
@@ -279,8 +626,12 @@ def getMasks(model, inputs, sigma=1):
         aligned_masks.append(masks[i])
 
     aligned_masks = np.concatenate(aligned_masks, axis=0)
-    smoothed_masks = gaussian_filter(aligned_masks, sigma=sigma)
-    return smoothed_masks
+    if sigma > 0.0:
+        if on_z_only:
+            aligned_masks = gaussian_filter1d(aligned_masks, sigma=sigma, axis=0)
+        else:
+            aligned_masks = gaussian_filter(aligned_masks, sigma=sigma)
+    return aligned_masks
 
 
 def xywh2mask(box, img_size):
@@ -294,3 +645,135 @@ def xywh2mask(box, img_size):
     y2 = min(int((y + h / 2) * img_size[0]), img_size[0] - 1)
     mask[y1:y2, x1:x2] = 1
     return mask
+
+
+def getPredictionCenters(df, classname, top_n=None, image_size=1024):
+    subdf = df[df["label"] == classname]
+    subdf = subdf[subdf["label_id"] != -1]
+    score = []
+    predict_center = []
+    ids = []
+    for i, subdf2 in subdf.groupby("label_id"):
+        if top_n is None:
+            score.append(np.sum(subdf2[classname]))
+        else:
+            score.append(np.sum(subdf2[classname].sort_values(ascending=False)[:top_n]))
+        predict_center.append(np.mean(subdf2[["z", "y", "x"]].values, axis=0))
+        ids.append(i)
+    ids = np.array(ids)
+    score = np.array(score)
+    predict_center = np.array(predict_center)
+    predict_center *= np.array([1, image_size, image_size])
+    return score, predict_center, ids
+
+
+def match_and_find_closest(pred_centers, label_centers):
+    """
+    Matches predicted centers to label centers using bipartite matching (Hungarian algorithm).
+    Also finds the closest prediction for each label.
+
+    Args:
+        pred_centers: np.ndarray of shape (N_pred, 3) — predicted (z, y, x) coordinates
+        label_centers: np.ndarray of shape (N_label, 3) — ground truth (z, y, x) coordinates
+
+    Returns:
+        match_pairs: list of (label_index, pred_index)
+        match_distances: np.ndarray of distances for the matched pairs
+        closest_preds: np.ndarray of shape (N_label, 2), where each row = (closest_pred_index, distance)
+    """
+    # Compute distance matrix between labels and predictions
+    dist_matrix = cdist(label_centers, pred_centers, metric="euclidean")
+
+    # --- Bipartite matching (Hungarian algorithm) ---
+    label_idx, pred_idx = linear_sum_assignment(dist_matrix)
+    match_pairs = list(zip(label_idx, pred_idx))
+    match_distances = dist_matrix[label_idx, pred_idx]
+
+    # --- Closest prediction for each label ---
+    closest_pred_indices = np.argmin(dist_matrix, axis=1)
+    closest_pred_distances = dist_matrix[
+        np.arange(len(label_centers)), closest_pred_indices
+    ]
+    closest_preds = np.stack(
+        [closest_pred_indices, closest_pred_distances], axis=1
+    )  # (N_label, 2)
+
+    return match_pairs, match_distances, closest_preds
+
+
+def get_labels_and_centers(label_matrix, labels=None):
+    """
+    Find all object labels and their centers in a 3D label matrix.
+
+    Args:
+        label_matrix: 3D NumPy array with 0 = background, 1,2,... = objects
+
+    Returns:
+        labels_1d: 1D NumPy array of object labels
+        centers_2d: 2D NumPy array of shape (n_objects, 3)
+                    with (z, y, x) coordinates for each object
+    """
+    # label_matrix = np.asarray(label_matrix)
+    if labels is None:
+        labels_id = np.unique(label_matrix)
+        labels_id = labels_id[labels_id != 0]  # remove background
+    else:
+        labels_id = np.asarray(labels)
+
+    centers_list = [
+        center_of_mass(label_matrix == label_val) for label_val in labels_id
+    ]
+
+    centers_2d = np.array(centers_list)  # shape (n_objects, 3)
+
+    return labels_id, centers_2d
+
+
+def calculate_metrics(match_pairs, match_distances, y_pred_prob, threshold=20):
+    """
+    Calculate AUROC, precision, and recall for binary classification.
+
+    Args:
+        y_true: array-like of shape (n_samples,) — ground truth labels (0 or 1)
+        y_pred_prob: array-like of shape (n_samples,) — predicted probabilities
+        threshold: float — probability threshold for converting to binary predictions
+
+    Returns:
+        auc_score: float — AUROC score
+        precision: float — Precision score
+        recall: float — Recall score
+    """
+    matches = np.array(match_pairs)
+    find_matches = np.array(match_distances) < threshold
+    matched = matches[find_matches]
+    score_label = np.zeros(len(y_pred_prob))
+    score_label[matched[:, 1]] = 1
+
+    precision, recall, _ = precision_recall_curve(score_label.astype(int), y_pred_prob)
+    aupr = auc(recall, precision)
+
+    aupr2 = average_precision_score(score_label.astype(int), y_pred_prob)
+
+    return {
+        "auroc": roc_auc_score(score_label.astype(int), y_pred_prob),
+        "aupr": aupr,
+        "aupr2": aupr2,
+        "cnts": sum(find_matches),
+        # "precision": precision_score(score_label.astype(int), y_pred_prob > 0.5),
+        # "recall": recall_score(score_label.astype(int), y_pred_prob > 0.5),
+    }
+
+    return roc_auc_score(score_label.astype(int), y_pred_prob), sum(find_matches)
+
+
+def calc_iou(pred_mask, true_mask):
+    # Ensure binary masks (0 or 1)
+    pred_mask = pred_mask > 0  # .float()
+    true_mask = true_mask > 0  # .float()
+
+    intersection = np.sum(pred_mask * true_mask)
+    union = np.sum(pred_mask) + np.sum(true_mask) - intersection
+
+    if union == 0:
+        return float("nan")  # Handle no-object case
+    return (intersection / union).item()
