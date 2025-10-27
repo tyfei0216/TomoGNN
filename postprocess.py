@@ -138,11 +138,18 @@ def getLabels(
     eps=0.4,
     dis_penalty_coef=1.0,
     dis_penalty_cutoff=2.0,
+    cutoff=None,
     enlarge=0.0,
     use_myscan=False,
 ):
     print(min_samples, eps, dis_penalty_coef, dis_penalty_cutoff)
     # print("df len", len(subdf))
+    if min_samples is None and cutoff is None:
+        raise ValueError("Either min_samples or cutoff must be provided.")
+
+    if min_samples is None:
+        min_samples = cutoff + 1
+
     hdb = DBSCAN(min_samples=min_samples, eps=eps, metric="precomputed")
     # subdf = subdf.sort_values(by="z")
     # zpos = subdf["z"].values
@@ -159,10 +166,14 @@ def getLabels(
     mask = mask[:, None] == mask[None, :]
     iou[mask] = 2.0
     # mask = subdf["z"].values
+    if cutoff is not None:
+        dis_penalty[dis_penalty <= cutoff] = 0.0
+        dis_penalty[dis_penalty > cutoff] = 2.0
+    else:
+        dis_penalty[dis_penalty > dis_penalty_cutoff] = 2.0 / dis_penalty_coef
+        # print(dis_penalty, dis_penalty_coef)
+        dis_penalty *= dis_penalty_coef
 
-    dis_penalty[dis_penalty > dis_penalty_cutoff] = 2.0 / dis_penalty_coef
-    # print(dis_penalty, dis_penalty_coef)
-    dis_penalty *= dis_penalty_coef
     iou = iou + dis_penalty
     if use_myscan:
         return myscan(iou, subdf["z"].values, eps=eps, max_z_diff=dis_penalty_cutoff)
@@ -647,17 +658,20 @@ def xywh2mask(box, img_size):
     return mask
 
 
-def getPredictionCenters(df, classname, top_n=None, image_size=1024):
+def getPredictionCenters(df, classname, top_n=None, image_size=1024, thres=None):
     subdf = df[df["label"] == classname]
     subdf = subdf[subdf["label_id"] != -1]
     score = []
     predict_center = []
     ids = []
     for i, subdf2 in subdf.groupby("label_id"):
+        value = subdf2[classname].values
+        if thres is not None:
+            value = value[value > thres]
         if top_n is None:
-            score.append(np.sum(subdf2[classname]))
+            score.append(np.sum(value))
         else:
-            score.append(np.sum(subdf2[classname].sort_values(ascending=False)[:top_n]))
+            score.append(np.sum(-np.sort(-value)[:top_n]))
         predict_center.append(np.mean(subdf2[["z", "y", "x"]].values, axis=0))
         ids.append(i)
     ids = np.array(ids)

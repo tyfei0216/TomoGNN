@@ -45,7 +45,7 @@ int_colors = [
 ]
 
 
-def drawannotation(image, target, box=True, mask=True, font_size=30):
+def drawannotation(image, target, box=True, mask=True, font_size=30, color=None):
     import matplotlib.pyplot as plt
     from torchvision.utils import draw_bounding_boxes, draw_segmentation_masks
 
@@ -75,12 +75,15 @@ def drawannotation(image, target, box=True, mask=True, font_size=30):
     # Annotate the sample image with labels and bounding boxes
     # if "names" in target:
     if box:
+        if color is not None:
+            color = [int_colors[color]] * len(target["bboxes"])
         annotated_tensor = draw_bounding_boxes(
             image=annotated_tensor,
             boxes=target["bboxes"],
             # labels=target["names"] if "names" in target else target["labels"],
             # font_size=font_size,
             width=5,
+            colors=color,
             # colors=[int_colors[i] for i in target["class_labels"]],
         )
 
