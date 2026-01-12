@@ -1,3 +1,26 @@
+"""Unified training script for DETR-based cryo-EM tasks.
+
+This script drives a PyTorch Lightning training run with TensorBoard logging
+and checkpointing. It supports different stages (e.g., `stage 1`, `stage 2`,
+`stage mask`) based on the configuration and builds the dataset via the local
+`data` module and the model via `utils.getModel`.
+
+Quick start:
+        python scripts/train.py \
+                -p /path/to/experiment \
+                -d 0 1 \
+                --strategy auto \
+                -n detr
+```
+
+Key notes:
+- `model.stage` selects dataset loaders and monitored metrics.
+- Checkpoints are saved to the `--path` directory, named using the monitored
+    validation metrics (e.g., `total_validate_loss`).
+- For multi-GPU, pass multiple device indices via `-d`.
+- Set `--checkpoint` to resume training from a saved Lightning checkpoint.
+"""
+
 import argparse
 import json
 import os
@@ -51,12 +74,14 @@ def run():
     print("loading dataset")
     # CHECKPOINT = "facebook/detr-resnet-50"
     # image_processor = DetrImageProcessor.from_pretrained(CHECKPOINT)
-    if configs["model"]["stage"] == "stage 1 + 2" or configs["model"][
+    if "mrc" in configs["data"]:
+        ds = data.get_stage12_dataset_mrc(configs)
+    elif configs["model"]["stage"] == "stage 1 + 2" or configs["model"][
         "stage"
     ].startswith("stage 1 + 2 + 3"):
         ds = data.get_stage12_dataset(configs)
     elif configs["model"]["stage"] == "stage 1":
-        ds = data.get_stage1_dataset(configs)
+        ds = data.get_stage12_dataset(configs)
     elif configs["model"]["stage"] == "stage 2":
         ds = data.get_stage2_dataset(configs)
     elif configs["model"]["stage"] == "stage mask":
@@ -82,7 +107,7 @@ def run():
     monitor = (
         "total_validate_loss"
         if configs["model"]["stage"] != "stage 2"
-        else "validate_auroc"
+        else "total_validate_loss"
     )
 
     if configs["model"]["stage"] == "stage mask":
@@ -93,7 +118,7 @@ def run():
     filename = (
         "{epoch}-{total_validate_loss:.4f}"
         if configs["model"]["stage"] != "stage 2"
-        else "{epoch}-{validate_loss:.4f}-{validate_auroc:.4f}"
+        else "{epoch}-{total_validate_loss:.4f}-{total_validate_auroc:.4f}"
     )
     if configs["model"]["stage"] == "stage mask":
         filename = "{epoch}-{total_validate_mask_auroc:.4f}"
@@ -147,6 +172,7 @@ def run():
         devices=args.devices,
         accelerator="gpu",
         max_epochs=configs["training"]["epochs"],
+        # val_check_interval=1000,
         gradient_clip_val=configs["training"]["gradient_clip_val"],
         accumulate_grad_batches=configs["training"]["accumulate_grad_batches"],
         log_every_n_steps=configs["training"]["log_every_n_steps"],

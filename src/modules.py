@@ -1,9 +1,23 @@
-import json
-import os
-import random
-import threading
-import time
-from collections import defaultdict
+"""Core model, loss, and utility modules for the cryoEM project.
+
+This file glues together three training stages:
+    stage 1   : DETR style transformer (object queries -> class/box/mask proposals)
+    stage 2   : Graph neural network reasoning over object-level embeddings
+    stage mask: High‑resolution segmentation (refines object masks with ViT+UNet hybrid)
+
+Composite / joint stages (e.g. "stage 1 + 2", "stage 1 + 2 + 3") execute these
+sub-stages sequentially inside a single Lightning step via `_common_step`.
+
+Key concepts:
+    - Boxes sometimes represented as normalized (cx, cy, w, h) in [0,1].
+    - `box_masks` / indices of valid boxes can be -1 for padding.
+    - For mask training we sub‑sample objects (self.num) using class weights to
+        mitigate imbalance.
+    - Several auxiliary losses (dice, focal, TV, noise) combined in `CompositeSegBBoxLoss`.
+    - `single_chunk_noise_loss` penalizes activations outside predicted boxes.
+
+NOTE: Some experimental / legacy sections remain (commented) for reference.
+"""
 
 import numpy as np
 import pandas as pd
@@ -11,38 +25,46 @@ import pycocotools
 import pytorch_lightning as L
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchmetrics
 import torchvision.datasets
 import torchvision.transforms.v2 as transforms
 from PIL import Image
 from pycocotools.coco import COCO
 from pytorch_lightning.utilities.combined_loader import CombinedLoader
-from skimage import exposure
-from torch.utils.data import Dataset
-from torch_geometric.data import Data
-from torch_geometric.data import Dataset as Gdataset
-from torchvision.tv_tensors import BoundingBoxes, Mask
+from torch_geometric.nn import (
+    AGNNConv,
+    GATConv,
+    GATv2Conv,
+    GCNConv,
+    SAGEConv,
+    TransformerConv,
+)
 from transformers.image_transforms import center_to_corners_format
 
 import utils
 
 
 class AdditionalInputLayer(nn.Module):
+    """Tiny MLP to project auxiliary per-node features to model dimension."""
+
     def __init__(self, in_dim, out_dim):
         super().__init__()
         self.layer1 = nn.Linear(in_dim, in_dim)
         self.layer2 = nn.Linear(in_dim, out_dim)
 
-    def forward(self, x):
+    def forward(self, x):  # (N, in_dim)
         x = self.layer1(x)
         x = nn.functional.relu(x)
         x = self.layer2(x)
-        return x
+        return x  # (N, out_dim)
 
 
 class EmptyContextManager:
+    """No-op context manager used to unify code paths with and without torch.no_grad."""
+
     def __enter__(self):
-        # No setup actions needed
+        # No setup actions needed（()
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
@@ -117,7 +139,7 @@ def box_iou(boxes1, boxes2):
     return iou, union
 
 
-# Copied from transformers.models.detr.sigmoid_focal_loss
+# Copied from transformers.models.detr.sigmoid_focal_loss (lightly adjusted)
 def sigmoid_focal_loss(
     inputs, targets, num_boxes=None, alpha: float = 0.25, gamma: float = 2
 ):
@@ -139,6 +161,8 @@ def sigmoid_focal_loss(
         Loss tensor
     """
     prob = inputs.sigmoid()
+    inputs = inputs.squeeze()
+    targets = targets.squeeze()
     ce_loss = nn.functional.binary_cross_entropy_with_logits(
         inputs, targets, reduction="none"
     )
@@ -156,6 +180,123 @@ def sigmoid_focal_loss(
     return loss.mean(1).sum() / num_boxes
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def dice_loss(pred, target, eps=1e-6):
+    """Dice loss for binary masks"""
+    pred = torch.sigmoid(pred)
+    intersection = (pred * target).sum(dim=(1, 2))
+    union = pred.sum(dim=(1, 2)) + target.sum(dim=(1, 2))
+    dice = (2 * intersection + eps) / (union + eps)
+    return 1 - dice.mean()
+
+
+def total_variation_loss(mask):
+    """Total variation for smoothness"""
+    loss = torch.mean(torch.abs(mask[:, :, :-1] - mask[:, :, 1:])) + torch.mean(
+        torch.abs(mask[:, :-1, :] - mask[:, 1:, :])
+    )
+    return loss
+
+
+# def smooth_l1_loss(pred_box, target_box):
+#     return F.smooth_l1_loss(pred_box, target_box)
+
+
+def single_chunk_noise_loss(pred_mask, target_mask, boxes, eps=0.02, warn=False):
+    """Penalize predicted mask activation outside predicted bounding boxes.
+
+    Args:
+        pred_mask: (B, H, W) raw logits.
+        target_mask: (B, H, W) ground truth (unused except for optional warning).
+        boxes: (B, 4) normalized (cx, cy, w, h) in [0,1]. Can be None / empty.
+        eps: float padding around each box (normalized) to tolerate minor misalign.
+        warn: if True, can emit console warning when GT mostly outside the box.
+
+    Returns:
+        Scalar tensor: mean activation outside boxes after sigmoid.
+    """
+    # Early exit if no boxes
+    if boxes is None or boxes.shape[0] == 0:
+        return pred_mask.new_tensor(0.0)
+
+    # Detach boxes to ensure no gradients are tracked for their ops
+    boxes = boxes.detach()
+
+    B, H, W = pred_mask.shape
+
+    # Convert (cx, cy, w, h) normalized -> pixel index ranges with padding eps
+    x_c, y_c, bw, bh = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    x1 = torch.clamp(x_c - bw / 2 - eps, min=0.0)
+    x2 = torch.clamp(x_c + bw / 2 + eps, max=1.0)
+    y1 = torch.clamp(y_c - bh / 2 - eps, min=0.0)
+    y2 = torch.clamp(y_c + bh / 2 + eps, max=1.0)
+
+    x1i = (x1 * W).long()
+    x2i = (x2 * W).long()
+    y1i = (y1 * H).long()
+    y2i = (y2 * H).long()
+
+    # Sigmoid predictions (no in-place ops afterwards)
+    pm = torch.sigmoid(pred_mask)
+
+    # inside_mask==1 inside the (expanded) box, 0 elsewhere
+    inside_mask = torch.zeros_like(pm)
+    for i in range(B):
+        if x1i[i] < x2i[i] and y1i[i] < y2i[i]:  # valid box
+            inside_mask[i, y1i[i] : y2i[i], x1i[i] : x2i[i]] = 1.0
+
+    outside_mask = 1.0 - inside_mask
+
+    # Optional sanity warning (no grad) if target largely outside predicted box
+    # if warn and target_mask is not None:
+    #     with torch.no_grad():
+    #         overlap_ratio = (inside_mask * target_mask).sum() / (target_mask.sum() + 1e-6)
+    #         if overlap_ratio < 0.9:
+    #             print("warning: target less inside box (overlap {:.3f})".format(float(overlap_ratio)))
+
+    # Mean activation outside the predicted box regions
+    loss = (pm * outside_mask).mean()
+    return loss
+
+
+class CompositeSegBBoxLoss(nn.Module):
+    def __init__(
+        self, lambda_dice=1.0, lambda_bce=1.0, lambda_tv=0.5, lambda_noise=0.5
+    ):
+        super().__init__()
+        self.lambda_dice = lambda_dice
+        self.lambda_bce = lambda_bce
+        self.lambda_tv = lambda_tv
+        self.lambda_noise = lambda_noise
+        self.warn = False
+
+    def forward(self, pred_mask, target_mask, pred_box):
+        """Compute composite segmentation loss.
+
+        Currently combines: Dice + focal (classification) + TV (smoothness).
+        A noise suppression term (mask leakage outside boxes) is computed but
+        excluded from total by default (can be re-enabled if desired).
+        """
+        loss_seg = dice_loss(pred_mask, target_mask)
+        loss_bce = sigmoid_focal_loss(pred_mask, target_mask, None, 0.25)
+        loss_tv = total_variation_loss(torch.sigmoid(pred_mask))
+        loss_noise = single_chunk_noise_loss(
+            pred_mask, target_mask, pred_box, warn=self.warn
+        )  # not added now
+
+        total_loss = (
+            self.lambda_dice * loss_seg
+            + self.lambda_bce * loss_bce
+            + self.lambda_tv * loss_tv
+            + self.lambda_noise * loss_noise  # optional
+        )
+        return total_loss
+
+
 class DetrModel(L.LightningModule):
     """
     main model for object detection and segmentation.
@@ -166,10 +307,6 @@ class DetrModel(L.LightningModule):
     stage 1 + 2: training detr and gnn together
     stage 1 + 2 + 3: training detr, gnn and mask head together
     stage 1 + 2 + 3 mask: train mask head alone but with data augmentation from raw slice input
-
-    for pretraining of detr, use stage 1
-    for fine-tuning using custom data, use stage 1 + 2 + 3
-    if mask is required, please further train mask head with stage mask
 
     all other modes are for debugging and testing purposes.
 
@@ -208,15 +345,18 @@ class DetrModel(L.LightningModule):
         output_dim,
         lr_detr=None,
         lr_backbone=None,
-        additional_input_dim=10,
-        additional_output_dim=16,
+        gnn_in_channel=10,
         layer_type="GCNConv",
         dropout=True,
         scheduler_step=-1,
         warmup_epoches=1,
         pick_num=6,
         mask_alpha=0.8,
-        sample_three=True,
+        mask_in_channel=3,
+        mask_out_channel=1,
+        class_weights=None,
+        consistency_regularization_coef=0.5,
+        box_head="lora",
     ):
         super().__init__()
         if isinstance(model, dict):
@@ -229,9 +369,11 @@ class DetrModel(L.LightningModule):
         assert stage in [
             "stage 1",
             "stage 2",
+            "stage 1 mask",
             "stage 1 + 2",
             "stage 1 + 2 + 3",
             "stage 1 + 2 + 3 mask",
+            "stage pretrain mask",
             "stage mask",
         ]
         print("model at stage ", stage)
@@ -243,12 +385,9 @@ class DetrModel(L.LightningModule):
         self.weight_decay = weight_decay
         self.training_step_outputs = []
         self.val_step_outputs = []
-        self.additional_input_dim = additional_input_dim
-        self.additional_output_dim = additional_output_dim
-
-        # self.additional_input_layer = AdditionalInputLayer(
-        #     additional_input_dim, additional_output_dim
-        # )
+        self.gnn_in_channel = gnn_in_channel
+        self.feature_dim = feature_dim
+        self.box_head = box_head
 
         self.acc = torchmetrics.Accuracy(
             task="multiclass", num_classes=output_dim, average="macro"
@@ -260,23 +399,45 @@ class DetrModel(L.LightningModule):
 
         self.gnn = GCN(
             feature_dim,
-            additional_input_dim,
+            gnn_in_channel,
             output_dim,
             layer_type=layer_type,
             dropout=dropout,
+            box_head=box_head,
         )
-        t = torch.ones((output_dim))
-        t[-1] = 0.1
+        self.class_weights = class_weights
+        if class_weights is not None:
+            t = torch.tensor(class_weights, dtype=torch.float32)
+        else:
+            t = torch.ones((output_dim))
+            t[-1] = 0.1
+
+        self.class_weights = (t - t[-1]).numpy()  # - t[-1]
+
+        print("model with output classes", output_dim)
+        print("model receiving class weights", t)
+
+        self.box_loss = CompositeSegBBoxLoss()
+
         self.cri = nn.CrossEntropyLoss(weight=t)
+        self.edge_cri = nn.BCEWithLogitsLoss(reduction="none")
+        self.kv = nn.KLDivLoss(reduction="batchmean")
+
+        print("using consistency regularization coef", consistency_regularization_coef)
+        self.consistency_regularization_coef = consistency_regularization_coef
+
         self.output_dim = output_dim
-        self.mask_head = VitForMask(embed_dim=feature_dim, sigmoid=False)
+        self.mask_head = VitForMask(
+            embed_dim=feature_dim,
+            sigmoid=False,
+            c_in=mask_in_channel,
+            c_out=mask_out_channel,
+        )
 
         self.scheduler_step = scheduler_step
 
         self.num = pick_num
         self.mask_alpha = mask_alpha
-
-        self.sample_three = sample_three
 
         self.box_in_for_mask = True
 
@@ -288,7 +449,7 @@ class DetrModel(L.LightningModule):
         pixel_mask=None,
         labels=None,
         mark=None,
-        stage_2_embeds=None,
+        embed=None,
         box=None,
     ):
         if "stage 1" in self.stage:
@@ -323,17 +484,17 @@ class DetrModel(L.LightningModule):
             return self.gnn(x, edge_index)
 
         elif "stage mask" in self.stage:
-            assert stage_2_embeds is not None
+            assert embed is not None
             assert pixel_values is not None
             if self.box_in_for_mask:
                 assert box is not None
                 return self.mask_head(
                     pixel_values,
-                    stage_2_embeds,
+                    embed,
                     box,  # .unsqueeze(1).repeat(1, self.num, 1),
                 )
             else:
-                return self.mask_head(pixel_values, stage_2_embeds)
+                return self.mask_head(pixel_values, embed)
 
         else:
             raise NotImplementedError
@@ -344,14 +505,24 @@ class DetrModel(L.LightningModule):
 
         return loss_bbox  # + 2 * loss_giou
 
-    def _common_step_stage1(self, batch, loss, loss_dict, return_outputs=False):
-        if batch is None:
-            return loss, loss_dict
-
+    def common_step_stage1(self, batch, return_outputs=False):
         if "stage 1" in self.stage:
 
-            pixel_values = batch["pixel_values"].to(self.device)
+            pixel_values = batch["pixel_values"]  # .to(self.device)
+            b, c, h, w = pixel_values.shape
+            if c > 3:
+                pixel_values = pixel_values[:, :3, :, :]
+
+            pixel_values = pixel_values.to(self.device)
+
             pixel_mask = batch["pixel_mask"].to(self.device)
+            # if "mark" in batch:
+            #     mark = batch["mark"][0]
+            # else:
+            #     mark = None
+
+            # if mark == "":
+            #     mark = None
             required_labels = []
             for t in batch["labels"]:
                 sample = {}
@@ -362,37 +533,33 @@ class DetrModel(L.LightningModule):
             # labels = [
             #     {k: v.to(self.device) for k, v in t.items()} for t in batch["labels"]
             # ]
-            b, c, w, h = pixel_values.shape
-            if c > 3 and self.sample_three:
-                pixel_values = pixel_values[:, [0, c // 2, -1], :, :]
+
+            # print(pixel_values, pixel_mask, required_labels)
+
             outputs = self(
                 pixel_values=pixel_values,
                 pixel_mask=pixel_mask,
                 labels=required_labels,
+                # mark=mark,
             )
-            loss += outputs.loss
-            if loss_dict is None:
-                loss_dict = outputs.loss_dict
-            else:
-                for i in loss_dict:
-                    loss_dict[i] += outputs.loss_dict[i]
+            # if mark is not None:
+            #     loss += outputs[mark].loss
+            #     if loss_dict is None:
+            #         loss_dict = outputs[mark].loss_dict.detach().cpu()
+            #     else:
+            #         for i in loss_dict:
+            #             loss_dict[i] += outputs[mark].loss_dict[i].detach().cpu()
+            # else:
+            loss = outputs.loss
+            loss_dict = outputs.loss_dict
+            for i in loss_dict:
+                loss_dict[i] = loss_dict[i].detach().cpu()
+            loss_dict["loss"] = loss.detach().cpu()
             if return_outputs:
                 return loss, loss_dict, outputs
-            return loss, {"loss": loss}
+            return loss, loss_dict
         else:
             raise ValueError("not in stage 1")
-
-    def common_step_stage1(self, batch):
-        loss = 0
-        loss_dict = None
-        if isinstance(batch, list):
-            # print("list")
-            for i in batch:
-                loss, loss_dict = self._common_step_stage1(i, loss, loss_dict)
-        else:
-            loss, loss_dict = self._common_step_stage1(batch, loss, loss_dict)
-
-        return loss, loss_dict
 
     def common_step_stage2(
         self,
@@ -404,6 +571,7 @@ class DetrModel(L.LightningModule):
         box_mask=None,
         edge_label=None,
         edge_mask=None,
+        edge_type=None,
         return_outputs=False,
     ):
 
@@ -415,8 +583,26 @@ class DetrModel(L.LightningModule):
         ret_dict = self(x=x, edge_index=edge)
         # print(ret_dict["predict"][mask].shape, y[mask].shape)
         # print(torch.max(y[mask]))
-
+        # print(ret_dict["predict"].shape)
+        # print(y)
+        # print(ret_dict["predict"][mask].shape)
         loss = self.cri(ret_dict["predict"][mask], y[mask])
+        if edge_type is not None and sum(edge_type) > 0:
+            # print(edge_type)
+            # print(edge_type)
+            # print(sum(edge_type))
+            inter_edge = (edge.T)[edge_type]
+            n1 = ret_dict["predict"][inter_edge[:, 0]]
+            n2 = ret_dict["predict"][inter_edge[:, 1]]
+            # print(n1.shape, n2.shape)
+            loss_consistency = self.kv(
+                torch.log_softmax(n1, dim=1),
+                torch.softmax(n2, dim=1),
+            ) + self.kv(
+                torch.log_softmax(n2, dim=1),
+                torch.softmax(n1, dim=1),
+            )
+            loss += self.consistency_regularization_coef * loss_consistency
         # self.auroc.update(ret_dict["predict"][mask].detach(), y[mask])
         # print("before auroc")
         loss_dict = {
@@ -440,36 +626,57 @@ class DetrModel(L.LightningModule):
         # print("before edge loss")
         if edge_label is not None:
             edge_label = edge_label.to(self.device)
-            if edge_mask is None:
-                edge_mask = torch.ones_like(edge_label, dtype=torch.bool)
-            loss_edge = F.binary_cross_entropy(
-                ret_dict["edge"].squeeze()[edge_mask], edge_label[edge_mask].float()
-            )
+            ret_dict["edge"] = ret_dict["edge"].to(self.device)
+            if edge_mask is not None:
+                # edge_mask = torch.ones_like(edge_label, dtype=torch.bool)
+                edge_mask = edge_mask.to(self.device)
+                ret_dict["edge"] = ret_dict["edge"][edge_mask]
+                edge_label = edge_label[edge_mask]
+            # print(
+            #     "shape before loss",
+            #     ret_dict["edge"].squeeze().shape,
+            #     edge_label.float().shape,
+            # )
+            edge_label = edge_label.float()
+            loss_edge = self.edge_cri(ret_dict["edge"].squeeze(), edge_label)
+            loss_edge = loss_edge * (edge_label + 0.1)
+            # print(loss_edge.shape)
+            loss_edge = loss_edge.mean()
+            # print(loss_edge.shape)
             loss += loss_edge
             loss_dict["loss_edge"] = loss_edge.detach().cpu()
         # print("after edge loss")
+
+        # print(loss, loss_dict)
 
         if return_outputs:
             return loss, loss_dict, ret_dict
         return loss, loss_dict
 
-    def common_stage_mask(
-        self, pixel_values, stage_2_embeds, mask, cal_auroc=False, box=None
-    ):
+    def common_stage_mask(self, pixel_values, embed, mask, cal_auroc=False, box=None):
         pixel_values = pixel_values.to(self.device).float()
-        stage_2_embeds = stage_2_embeds.to(self.device).float()
+        embed = embed.to(self.device).float()
         mask = mask.to(self.device).float()
-        outputs = self(
-            pixel_values=pixel_values, stage_2_embeds=stage_2_embeds, box=box
+        outputs = self(pixel_values=pixel_values, embed=embed, box=box)
+        loss = self.box_loss(
+            outputs,
+            mask.float(),
+            box if box is not None else torch.zeros((1, 4)).to(self.device),
         )
-        loss = sigmoid_focal_loss(outputs, mask.float(), alpha=self.mask_alpha)
-        # print("after focal loss")
+        # loss = sigmoid_focal_loss(outputs, mask.float(), alpha=self.mask_alpha)
+        # # print("after focal loss")
+
+        # loss += 0.5 * (
+        #     torch.mean(torch.abs(mask[:, :, :, :-1] - mask[:, :, :, 1:]))
+        #     + torch.mean(torch.abs(mask[:, :, :-1, :] - mask[:, :, 1:, :]))
+        # )
+
         if cal_auroc:
             auroc = self.mask_auroc(
-                outputs.detach().view(-1).cpu(), mask.detach().view(-1).cpu()
+                outputs.detach().view(-1), mask.detach().view(-1)
             ).cpu()
-            # self.mask_auroc.reset()
-            # torch.cuda.empty_cache()
+            self.mask_auroc.reset()
+            torch.cuda.empty_cache()
             return loss, {"loss": loss.detach().cpu(), "mask_auroc": auroc}
         # loss = F.binary_cross_entropy(outputs, mask.float())
         return loss, {"loss": loss.detach().cpu()}
@@ -477,7 +684,7 @@ class DetrModel(L.LightningModule):
     def on_validation_epoch_end(self):
         # loss = torch.stack(self.val_step_outputs).mean()
         losses = np.mean([i["loss"] for i in self.val_step_outputs])
-        if "stage mask" in self.stage or "stage 1 + 2 + 3" in self.stage:
+        if "mask" in self.stage or "stage 1 + 2 + 3" in self.stage:
             # auroc = self.mask_auroc.compute()
             auroc = np.nanmean(
                 [i["mask_auroc"] for i in self.val_step_outputs if "mask_auroc" in i]
@@ -493,14 +700,23 @@ class DetrModel(L.LightningModule):
                 [i["loss_boxes"] for i in self.val_step_outputs if "loss_boxes" in i]
             )
             self.log("total_validate_loss_boxes", loss_boxes, prog_bar=True)
-
+        if "loss_ce" in self.val_step_outputs[0]:
+            ce_loss = np.mean(
+                [i["loss_ce"] for i in self.val_step_outputs if "loss_ce" in i]
+            )
+            self.log("total_validate_loss_ce", ce_loss, prog_bar=True)
+        if "loss_bbox" in self.val_step_outputs[0]:
+            bbox_loss = np.mean(
+                [i["loss_bbox"] for i in self.val_step_outputs if "loss_bbox" in i]
+            )
+            self.log("total_validate_loss_bbox", bbox_loss, prog_bar=True)
         self.log("total_validate_loss", losses, prog_bar=True)
         self.val_step_outputs.clear()
 
     def on_train_epoch_end(self):
         # loss = torch.stack(self.val_step_outputs).mean()
         losses = np.mean([i["loss"] for i in self.training_step_outputs])
-        if "stage mask" in self.stage or "stage 1 + 2 + 3" in self.stage:
+        if "mask" in self.stage or "stage 1 + 2 + 3" in self.stage:
             auroc = np.nanmean(
                 [
                     i["mask_auroc"]
@@ -524,24 +740,25 @@ class DetrModel(L.LightningModule):
                 ]
             )
             self.log("total_train_loss_boxes", loss_boxes, prog_bar=True)
-
         self.log("total_train_loss", losses, prog_bar=True)
         self.training_step_outputs.clear()
 
     def _common_step(self, batch):
+        """Unified training / validation step dispatcher.
+
+        Depending on current `self.stage`, executes one or more of:
+          stage 1 (DETR), stage 2 (GNN), stage mask (segmentation).
+        Composite stages chain these together while temporarily overriding
+        `self.stage` to re-use sub-step methods, then restore it.
+        """
         if "stage 1 + 2 + 3" in self.stage:
             temp = self.stage
             n, _, _, _ = batch[0]["pixel_values"].shape
-
-            t = torch.no_grad
-            if self.lr_detr > 0.0000001:
-                t = EmptyContextManager
-            # print("stage 1")
+            t = EmptyContextManager
+            if self.lr_detr < 1e-6:
+                t = torch.no_grad
             with t():
-                loss, loss_dict, output = self._common_step_stage1(
-                    batch[0], 0, None, True
-                )
-                # print("stage 2")
+                loss, loss_dict, output = self.common_step_stage1(batch[0], True)
                 retdict = utils.process(
                     output,
                     batch[0]["labels"],
@@ -549,23 +766,19 @@ class DetrModel(L.LightningModule):
                     empty=self.output_dim - 1,
                 )
                 data2 = utils.convertStage2Dataset(
-                    retdict, num_classes=self.output_dim - 1
+                    retdict, num_classes=self.output_dim - 1, obj_thres=0.2
                 )
                 self.stage = "stage 2"
                 x = data2.x
                 y = data2.y
                 edge_index = data2.edge_index
                 mask = torch.ones_like(y, dtype=torch.bool)
-                boxes = data2.boxes  # if hasattr(data2, "boxes") else None
-                box_masks = data2.box_masks  # if hasattr(data2, "box_masks") else None
-                # if box_masks is not None:
-                #     box_masks = box_masks>-1
+                boxes = data2.boxes
+                box_masks = data2.box_masks
+                edge_type = data2.inter_edges if hasattr(data2, "inter_edges") else None
                 edge_label = (
-                    data2.edge_label
-                )  # if hasattr(batch, "edge_label") else None
-                # edge_label = None
-                # if edge_label is None:
-                #     print("edge_label is None")
+                    (data2.edge_label) if hasattr(batch, "edge_label") else None
+                )
                 loss2, loss_dict2, outputs = self.common_step_stage2(
                     x,
                     edge_index,
@@ -575,90 +788,146 @@ class DetrModel(L.LightningModule):
                     box_masks > -1,
                     edge_label,
                     return_outputs=True,
+                    edge_type=edge_type,
                 )
                 loss += loss2
                 self.stage = "stage mask"
 
-                img = batch[0]["pixel_values"][n // 2]
+                if "mask_input" in batch[0]["labels"][n // 2]:
+                    img = batch[0]["labels"][n // 2]["mask_input"]
+                else:
+                    img = batch[0]["pixel_values"][n // 2]
+
                 embeds = outputs["embeddings"]
                 objects, _ = embeds.shape
                 obj_per_image = objects // n
-                masks = []
-                stage_2_embeds = []
                 sub_embeds = embeds[
                     (n // 2) * obj_per_image : (n // 2 + 1) * obj_per_image
                 ]
                 sub_box_masks = box_masks[
                     (n // 2) * obj_per_image : (n // 2 + 1) * obj_per_image
                 ]
-                # y = data2.y
-                # y = y[(n // 2) * obj_per_image : (n // 2 + 1) * obj_per_image]
-                # t = retdict["masks"]
                 pick_from = torch.where((sub_box_masks > -1))[0]
                 boxes = outputs["box"]
 
             if len(pick_from) > 0:
                 if len(pick_from) <= self.num:
                     stage_2_embeds = sub_embeds[pick_from]
-                    pick_index = sub_box_masks[pick_from]
                     box = boxes[pick_from]
-                    masks = retdict["masks"][pick_index]
-
+                    masks = retdict["masks"]
                 else:
                     tensor = torch.arange(len(pick_from))
                     indices = torch.randperm(tensor.size(0))[: self.num]
                     selected = pick_from[indices]
                     stage_2_embeds = sub_embeds[selected]
                     box = boxes[selected]
-                    pick_index = sub_box_masks[selected]
-                    masks = retdict["masks"][pick_index]
+                    masks = retdict["masks"][indices]
+
+                masks = masks.squeeze(1)
                 num_masks = masks.sum(axis=[1, 2])
                 num_masks = num_masks > 0
-                if num_masks.sum() > 0:
+                if num_masks.any():
+                    masks = masks[num_masks].to(self.device)
+                    num_masks = num_masks.to(self.device)
                     stage_2_embeds = stage_2_embeds[num_masks]
-                    masks = masks[num_masks]
                     box = box[num_masks]
-                    img = img[None, :, :, :].repeat(stage_2_embeds.shape[0], 1, 1, 1)
+                    img = img.repeat(stage_2_embeds.shape[0], 1, 1, 1)
                     loss3, loss_dict3 = self.common_stage_mask(
                         img, stage_2_embeds, masks, True, box
                     )
-                    loss += loss3
+                    if self.lr_detr < 1e-6:
+                        loss = loss3
+                    else:
+                        loss += loss3
                     loss_dict2["mask_auroc"] = loss_dict3["mask_auroc"]
+                    loss_dict2["loss"] = loss.detach().cpu()
             else:
                 loss_dict2["mask_auroc"] = np.nan
 
-            self.stage = temp  # "stage 1 + 2 + 3"
+            self.stage = temp
             loss_dict = loss_dict2
-            # loss_dict["auroc_mask"] = loss_dict3["auroc"]
+        elif "stage 1 mask" in self.stage:
+            self.stage = "stage 1"
+            t = EmptyContextManager
+            if self.lr_detr < 1e-6:
+                t = torch.no_grad
+            with t():
+                loss, loss_dict, output = self.common_step_stage1(batch[0], True)
+                if "mask_input" in batch[0]["labels"][0]:
+                    img = batch[0]["labels"][0]["mask_input"]
+                else:
+                    img = batch[0]["pixel_values"][0]
+                retdict = utils.process_stage1(output, batch[0]["labels"])
+                masks = retdict["masks"]
+                boxes = retdict["pred_boxes"]
+                embeds = retdict["feature"]
+                obj_pos = retdict["obj_pos"]
+                label = retdict["label"].cpu().numpy()
+                weights = self.class_weights[label]
+                picked = utils.unique_random_sample_indices(weights, self.num)
+                embeds = embeds[picked]
+                boxes = boxes[picked]
+                obj_pos = obj_pos[picked]
+                masks = masks[obj_pos]
+                self.stage = "stage mask"
+                if masks.dim() == 4:
+                    masks = masks.squeeze(1)
+                num_masks = masks.sum(axis=[1, 2]) > 0
+            if num_masks.any():
+                masks = masks[num_masks]
+                embeds = embeds[num_masks]
+                boxes = boxes[num_masks]
+                img = img.repeat(embeds.shape[0], 1, 1, 1)
+                loss2, loss_dict2 = self.common_stage_mask(
+                    img, embeds, masks, True, boxes
+                )
+                loss = loss2 if self.lr_detr < 1e-6 else loss + loss2
+                if self.lr_detr < 1e-6:
+                    loss_dict = loss_dict2
+                else:
+                    loss_dict["mask_auroc"] = loss_dict2["mask_auroc"]
+            else:
+                print(
+                    "encountered empty masks. This could be caused by data augmentation"
+                )
+            self.stage = "stage 1 mask"
         elif "stage 1 + 2" in self.stage:
-            loss, loss_dict, output = self._common_step_stage1(batch[0], 0, None, True)
-
-            n, _, _, _ = batch[0]["pixel_values"].shape
-            retdict = utils.process(output, batch[0]["labels"])
-            data2 = utils.convertStage2Dataset(retdict)
-
+            t = EmptyContextManager
+            if self.lr_detr < 1e-8:
+                t = torch.no_grad
+            with t():
+                loss, loss_dict, output = self.common_step_stage1(batch[0], True)
+                retdict = utils.process(
+                    output, batch[0]["labels"], empty=self.output_dim - 1
+                )
+                data2 = utils.convertStage2Dataset(
+                    retdict, obj_thres=0.15, num_classes=self.output_dim - 1
+                )
             self.stage = "stage 2"
             x = data2.x
             y = data2.y
-
-            predicts = len(y) // n
             edge_index = data2.edge_index
-            mask = torch.zeros_like(y, dtype=torch.bool)
-            mask[(n // 2) * predicts : (n // 2 + 1) * predicts] = True
+            mask = torch.ones_like(y, dtype=torch.bool)
             boxes = data2.boxes if hasattr(data2, "boxes") else None
             box_masks = data2.box_masks if hasattr(data2, "box_masks") else None
-            # edge_label = data2.edge_label  # if hasattr(batch, "edge_label") else None
+            edge_type = data2.inter_edges if hasattr(data2, "inter_edges") else None
             edge_label = None
-            # if edge_label is None:
-            #     print("edge_label is None")
             loss2, loss_dict2 = self.common_step_stage2(
-                x, edge_index, mask, y, boxes, box_masks, edge_label
+                x,
+                edge_index,
+                mask,
+                y,
+                boxes,
+                box_masks > -1,
+                edge_label,
+                edge_type=edge_type,
+                return_outputs=False,
             )
             self.stage = "stage 1 + 2"
             loss = loss + loss2
             loss_dict = loss_dict2
         elif "stage 1" in self.stage:
-            loss, loss_dict = self.common_step_stage1(batch)
+            loss, loss_dict = self.common_step_stage1(batch[0])
         elif "stage 2" in self.stage:
             mask = batch.train_mask
             y = batch.y
@@ -668,6 +937,7 @@ class DetrModel(L.LightningModule):
             edge_mask = (
                 batch.train_edge_mask if hasattr(batch, "train_edge_mask") else None
             )
+            edge_type = batch.inter_edges if hasattr(batch, "inter_edges") else None
             loss, loss_dict = self.common_step_stage2(
                 batch.x,
                 batch.edge_index,
@@ -677,29 +947,57 @@ class DetrModel(L.LightningModule):
                 box_masks,
                 edge_label,
                 edge_mask,
+                edge_type=edge_type,
             )
-
         elif "stage mask" in self.stage:
-
             pixel_values, stage_2_embeds, pixel_mask, box = batch
-            # print(pixel_mask)
             loss, loss_dict = self.common_stage_mask(
                 pixel_values, stage_2_embeds, pixel_mask, True, box=box
             )
-
+        elif "stage pretrain mask" in self.stage:
+            temp = self.stage
+            self.stage = "stage mask"
+            inputs = batch[0]["labels"][0]["mask_input"]
+            boxes = batch[0]["labels"][0]["boxes"]
+            b, _ = boxes.shape
+            stage_2_embeds = torch.zeros((b, 256)).to(self.device)
+            stage_2_embeds.requires_grad_(False)
+            pick_from = torch.arange(b).to(self.device)
+            pick_from.requires_grad_(False)
+            masks = batch[0]["labels"][0]["masks"]
+            if len(pick_from) > 0:
+                if len(pick_from) > self.num:
+                    indices = torch.randperm(pick_from.size(0))[: self.num]
+                    stage_2_embeds = stage_2_embeds[indices]
+                    boxes = boxes[indices]
+                    masks = masks[indices]
+                num_masks = masks.sum(axis=[1, 2, 3]) > 0
+                if num_masks.any():
+                    masks = masks[num_masks].to(self.device)
+                    num_masks = num_masks.to(self.device)
+                    stage_2_embeds = stage_2_embeds[num_masks]
+                    boxes = boxes[num_masks]
+                    img = inputs.repeat(stage_2_embeds.shape[0], 1, 1, 1)
+                    loss3, loss_dict3 = self.common_stage_mask(
+                        img, stage_2_embeds, masks, True, boxes
+                    )
+                    loss = loss3
+                    loss_dict = loss_dict3
+            else:
+                loss = 0.0
+                loss_dict = {"mask_auroc": np.nan}
+            self.stage = temp
         return loss, loss_dict
 
     def training_step(self, batch, batch_idx=0, loader_idx=0):
 
         loss, loss_dict = self._common_step(batch)
+        loss_dict["loss"] = loss.detach().cpu()
         # logs metrics for each training_step, and the average across the epoch
         self.log("training_loss", loss, prog_bar=True)
-        res = {}
-        for k, v in loss_dict.items():
-            res[k] = v.detach().cpu()
         # for k, v in loss_dict.items():
         #     self.log("train_" + k, v.item(), prog_bar=False)
-        self.training_step_outputs.append(res)
+        self.training_step_outputs.append(loss_dict)
         return loss
 
     def validation_step(self, batch, batch_idx=0, loader_idx=0):
@@ -717,6 +1015,12 @@ class DetrModel(L.LightningModule):
         return loss
 
     def configure_optimizers(self):
+        """Create optimizer(s) with per-stage parameter grouping.
+
+        Different stages freeze / unfreeze subsets (backbone, transformer, GNN,
+        mask head) and may assign distinct LRs. Two schedulers can be attached:
+        a warmup (custom) and an optional StepLR when `scheduler_step>0`.
+        """
         optim = None
         if "stage 1 + 2 + 3 mask" in self.stage:
             d1 = []
@@ -743,6 +1047,78 @@ class DetrModel(L.LightningModule):
                     },
                 )
             optim = torch.optim.AdamW(param_dicts)
+
+        elif "stage 1 mask" in self.stage:
+            # if self.lr_backbone is not None:
+
+            d1 = []
+            d2 = []
+            d3 = []
+            for n, p in self.named_parameters():
+                if "backbone" in n and p.requires_grad:
+                    d1.append(p)
+                elif ".model" in n:
+                    d2.append(p)
+                elif "mask_head" in n:
+                    d3.append(p)
+            # self.lr_backbone = self.lr
+            param_dicts = []
+            if self.lr_backbone > 1e-6:
+                param_dicts.append({"params": d1, "lr": self.lr_backbone})
+            if self.lr_detr > 1e-6:
+                param_dicts.append(
+                    {
+                        "params": d2,
+                        "lr": self.lr_detr,
+                    }
+                )
+            if self.lr > 1e-6:
+                param_dicts.append(
+                    {
+                        "params": d3,
+                        "lr": self.lr,
+                    }
+                )
+            if self.weight_decay > 0:
+                optim = torch.optim.AdamW(param_dicts, weight_decay=self.weight_decay)
+            else:
+                optim = torch.optim.Adam(param_dicts)
+
+        elif "stage 1 + 2" in self.stage:
+            # if self.lr_backbone is not None:
+
+            d1 = []
+            d2 = []
+            d3 = []
+            for n, p in self.named_parameters():
+                if "backbone" in n and p.requires_grad:
+                    d1.append(p)
+                elif ".model" in n:
+                    d2.append(p)
+                elif "gnn" in n:
+                    d3.append(p)
+            # self.lr_backbone = self.lr
+            param_dicts = []
+            if self.lr_backbone > 1e-6:
+                param_dicts.append({"params": d1, "lr": self.lr_backbone})
+            if self.lr_detr > 1e-6:
+                param_dicts.append(
+                    {
+                        "params": d2,
+                        "lr": self.lr_detr,
+                    }
+                )
+            if self.lr > 1e-6:
+                param_dicts.append(
+                    {
+                        "params": d3,
+                        "lr": self.lr,
+                    }
+                )
+            if self.weight_decay > 0:
+                optim = torch.optim.AdamW(param_dicts, weight_decay=self.weight_decay)
+            else:
+                optim = torch.optim.Adam(param_dicts)
 
         elif "stage 1" in self.stage:
             if self.lr_backbone is not None:
@@ -832,18 +1208,6 @@ class DetrModel(L.LightningModule):
             return optim
 
 
-import torch
-import torch.nn.functional as F
-from torch_geometric.nn import (
-    AGNNConv,
-    GATConv,
-    GATv2Conv,
-    GCNConv,
-    SAGEConv,
-    TransformerConv,
-)
-
-
 class SimpleLinear(nn.Module):
     def __init__(self, in_dim, out_dim):
         super(SimpleLinear, self).__init__()
@@ -890,9 +1254,11 @@ class GCN(torch.nn.Module):
         input_dim,
         additional_input_dim,
         output_classes,
-        layer_type="GCNConv",
+        layer_type="TransformerConv",
         dropout=False,
-        zpos=100,
+        zpos=500,
+        box_head="lora",
+        record=False,
     ):
 
         super().__init__()
@@ -936,12 +1302,21 @@ class GCN(torch.nn.Module):
         #     nn.ReLU(),
         #     LoRALayer(input_dim // 2, output_classes, 4),
         # )
-        self.box_head = nn.Sequential(
-            nn.Linear(input_dim, input_dim // 2),
-            nn.ReLU(),
-            LoRALayer(input_dim // 2, 4, 4),
-            nn.Tanh(),
-        )
+        self.box = box_head
+        if box_head == "lora":
+            self.box_head = nn.Sequential(
+                nn.Linear(input_dim, input_dim // 2),
+                nn.ReLU(),
+                LoRALayer(input_dim // 2, 4, 4),
+                nn.Tanh(),
+            )
+        else:
+            self.box_head = nn.Sequential(
+                nn.Linear(input_dim, input_dim // 2),
+                nn.ReLU(),
+                nn.Linear(input_dim // 2, 4),
+                nn.Sigmoid(),
+            )
 
         self.dropout = dropout
 
@@ -955,12 +1330,16 @@ class GCN(torch.nn.Module):
         )
 
         self.zpos = zpos
+        if record:
+            self.record = []
+        else:
+            self.record = None
 
     def inipos(self, channels):
         inv_freq = 1.0 / (
             (100 * 10) ** (torch.arange(0, channels, 2).float() / channels)
         )  # .to(self.device)
-        t = torch.arange(0, 105)[:, None]  # .to(self.device)
+        t = torch.arange(0, 505)[:, None]  # .to(self.device)
         # print(t.shape, inv_freq.shape)
         pos_enc_a = torch.sin(t.repeat(1, channels // 2) * inv_freq)
         pos_enc_b = torch.cos(t.repeat(1, channels // 2) * inv_freq)
@@ -977,6 +1356,9 @@ class GCN(torch.nn.Module):
 
         pos = (additional_input[:, 0] * self.zpos).long()
         pos_embed = self.pe[pos]
+
+        # additional_feature = self.additional_input_layer(additional_input)
+        # x = model_feature + additional_feature + pos_embed
 
         feature = self.additional_input_layer(inputs)
         x = feature + pos_embed
@@ -1002,7 +1384,10 @@ class GCN(torch.nn.Module):
         predict = self.cls_head(x)
         # predict[:, : self.output_classes - 1] += inputs[:, 5 : self.output_classes + 4]
 
-        box = self.box_head(x) + inputs[:, 1:5]
+        if self.box == "lora":
+            box = self.box_head(x) + inputs[:, 1:5]
+        else:
+            box = self.box_head(x)
 
         row, col = edge_index
         edge_embeddings = torch.cat([x[row], x[col]], dim=1)
@@ -1018,10 +1403,10 @@ class DoubleConv(nn.Module):
         if not mid_channels:
             mid_channels = out_channels
         self.double_conv = nn.Sequential(
-            nn.Conv2d(in_channels, mid_channels, kernel_size=7, padding=3),
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1),
             nn.GroupNorm(1, mid_channels),
             nn.GELU(),
-            nn.Conv2d(mid_channels, out_channels, kernel_size=7, padding=3),
+            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1),
             nn.GroupNorm(1, out_channels),
         )
 
@@ -1080,27 +1465,33 @@ class Up(nn.Module):
 
 
 class VitForMask(nn.Module):
-    def __init__(self, c_in=11, c_out=11, embed_dim=272, sigmoid=True):
+    def __init__(self, c_in=3, c_out=1, embed_dim=272, sigmoid=True, TF=0.5):
         super().__init__()
         # self.ini = DoubleConv()
 
-        self.inc = DoubleConv(c_in + 1, 32)
+        # 16 * 800 * 800
+        self.inc = DoubleConv(c_in + 1, 16)
 
-        self.down1 = Down(32, 64, embed_dim)
+        # 16 * 400 * 400
+        self.down1 = Down(16, 32, embed_dim)
 
-        self.down2 = Down(64, 128, embed_dim)
+        # 64 * 200 * 200
+        self.down2 = Down(32, 64, embed_dim)
 
-        self.down3 = Down(128, 256, embed_dim)
+        # 128 * 100 * 100
+        self.down3 = Down(64, 128, embed_dim)
 
-        self.down4 = Down(256, 1024, embed_dim)
+        # 256 * 50 * 50
+        self.down4 = Down(128, 512, embed_dim)
 
+        # 512 * 25 * 25
         # self.down5 = Down(256, 512, embed_dim)
-        self.l = nn.Sequential(nn.Linear(embed_dim, 1024), nn.GELU())
-        self.pos_embed = nn.Parameter(torch.randn(1, 1024 + 1, 1024))
+        self.l = nn.Sequential(nn.Linear(embed_dim, 512), nn.GELU())
+        self.pos_embed = nn.Parameter(torch.randn(1, 2500 + 1, 512))
         self.transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
-                d_model=1024,
-                nhead=16,
+                d_model=512,
+                nhead=8,
                 dim_feedforward=1024,
                 dropout=0.1,
                 activation="gelu",
@@ -1108,64 +1499,193 @@ class VitForMask(nn.Module):
             num_layers=6,
         )
 
-        self.up3 = Up(1024 + 256, 128, (64, 64), embed_dim)
+        # 128 * 100 * 100
+        self.up3 = Up(512 + 128, 64, (100, 100), embed_dim)
 
-        self.up4 = Up(256, 64, (128, 128), embed_dim)
+        # 64 * 200 * 200
+        self.up4 = Up(128, 32, (200, 200), embed_dim)
 
-        self.up5 = Up(128, 32, (256, 256), embed_dim)
+        # 32 * 400 * 400
+        self.up5 = Up(64, 16, (400, 400), embed_dim)
 
-        self.up6 = Up(64, 64, (512, 512), embed_dim)
+        # 32 * 800 * 800
+        self.up6 = Up(32, 32, (800, 800), embed_dim)
 
-        self.outc = nn.Conv2d(64, c_out, kernel_size=1)
+        # 1 * 800 * 800
+        self.outc = nn.Conv2d(32, c_out, kernel_size=1)
 
         self.sigmoid = sigmoid
 
+        self.TF = TF
+
     def forward(self, x, t, boxes):
         B, C, H, W = x.shape
-        b1 = boxes[:, 0] - boxes[:, 2] / 2
-        b2 = boxes[:, 0] + boxes[:, 2] / 2
-        b3 = boxes[:, 1] - boxes[:, 3] / 2
-        b4 = boxes[:, 1] + boxes[:, 3] / 2
-        b1, b2, b3, b4 = (
-            (b1 * W).long(),
-            (b2 * W).long(),
-            (b3 * H).long(),
-            (b4 * H).long(),
-        )
         mask = torch.zeros((B, 1, H, W), device=x.device, dtype=x.dtype)
-        for i in range(B):
-            mask[i, 0, b3[i] : b4[i], b1[i] : b2[i]] = 1.0
+        if self.TF > 0:
+            if torch.rand(1) < self.TF:
+                # return torch.zeros((B, 1, H, W), device=x.device, dtype=x.dtype)
+                b1 = boxes[:, 0] - boxes[:, 2] / 2
+                b1 = torch.clamp(b1, min=0.0)
+                b2 = boxes[:, 0] + boxes[:, 2] / 2
+                b2 = torch.clamp(b2, max=1.0)
+                b3 = boxes[:, 1] - boxes[:, 3] / 2
+                b3 = torch.clamp(b3, min=0.0)
+                b4 = boxes[:, 1] + boxes[:, 3] / 2
+                b4 = torch.clamp(b4, max=1.0)
+                b1, b2, b3, b4 = (
+                    (b1 * W).long(),
+                    (b2 * W).long(),
+                    (b3 * H).long(),
+                    (b4 * H).long(),
+                )
+                for i in range(B):
+                    mask[i, 0, b3[i] : b4[i], b1[i] : b2[i]] = 1.0
 
         mask.requires_grad_(False)
 
         x = torch.cat((x, mask), dim=1)
 
+        # if self.record is not None:
+        #     self.record.append(x.detach().cpu().numpy())
+
         x1 = self.inc(x)
-
         x2 = self.down1(x1, t)
-
         x3 = self.down2(x2, t)
-
         x4 = self.down3(x3, t)
-
         x5 = self.down4(x4, t)
 
-        x5 = x5.view(-1, 1024, 1024).transpose(1, 2)
+        x5 = x5.view(-1, 512, 2500).transpose(1, 2)
         l = self.l(t).unsqueeze(1)
         x = torch.cat((l, x5), dim=1)
         x += self.pos_embed
         # x5 = x5.transpose()
         x = self.transformer(x)
         x = x[:, 1:, :]
-        x = x.transpose(1, 2).view(-1, 1024, 32, 32)
+        x = x.transpose(1, 2).view(-1, 512, 50, 50)
 
         x = self.up3(x, x4, t)
         x = self.up4(x, x3, t)
         x = self.up5(x, x2, t)
         x = self.up6(x, x1, t)
-        output = self.outc(x)  # .squeeze(1)
+        output = self.outc(x).squeeze(1)
 
         if self.sigmoid:
             output = torch.sigmoid(output)
 
         return output
+
+
+class ParticleID3DNet_Binary(L.LightningModule):
+
+    def __init__(self, num_classes=1, regression=False):
+        super().__init__()
+        self.save_hyperparameters()
+
+        # 3D convolutional backbone
+        self.conv1 = nn.Conv3d(1, 16, kernel_size=5, padding=2)
+        self.bn1 = nn.BatchNorm3d(16)
+        self.conv1_1 = nn.Conv3d(16, 16, kernel_size=5, padding=2)
+
+        self.conv2 = nn.Conv3d(16, 32, kernel_size=5, padding=2)
+        self.bn2 = nn.BatchNorm3d(32)
+        self.conv2_1 = nn.Conv3d(32, 32, kernel_size=5, padding=2)
+
+        self.conv3 = nn.Conv3d(32, 64, kernel_size=5, padding=2)
+        self.bn3 = nn.BatchNorm3d(64)
+        self.conv3_1 = nn.Conv3d(64, 64, kernel_size=5, padding=2)
+
+        self.pool = nn.MaxPool3d(2)
+
+        # After 3 poolings: 65 -> 32 -> 16 -> 8
+        self.fc1 = nn.Linear(64 * 8 * 8 * 8, 128)
+
+        self.num_classes = num_classes
+        self.regression = regression
+        if regression:
+            self.fc2 = nn.Linear(128, num_classes)  # output dim = regression dim
+            self.criterion = nn.MSELoss()
+        elif num_classes == 1:
+            self.fc2 = nn.Linear(128, 1)
+            self.criterion = nn.BCEWithLogitsLoss()
+        else:
+            self.fc2 = nn.Linear(128, num_classes)
+            self.criterion = nn.CrossEntropyLoss()
+
+        self.training_step_outputs = []
+        self.val_step_outputs = []
+
+    def forward(self, x):
+        x = self.pool(F.relu(self.bn1(self.conv1(x))))
+        x = F.relu(self.conv1_1(x))
+        x = self.pool(F.relu(self.bn2(self.conv2(x))))
+        x = F.relu(self.conv2_1(x))
+        x = self.pool(F.relu(self.bn3(self.conv3(x))))
+        x = F.relu(self.conv3_1(x))
+        x = torch.flatten(x, start_dim=1)
+        x = F.relu(self.fc1(x))
+        out = self.fc2(x)
+        if self.regression:
+            return out  # shape (B, num_regression)
+        elif self.num_classes == 1:
+            return out.squeeze(1)  # (B,)
+        else:
+            return out  # (B, num_classes)
+
+    def shared_step(self, batch, stage, l):
+        x, y = batch
+        logits = self(x)
+        if self.regression:
+            # y shape: (B, num_regression)
+            loss = self.criterion(logits, y)
+            l.append({"y": y.cpu().numpy(), "pre": logits.detach().cpu().numpy()})
+            return loss
+        elif self.num_classes == 1:
+            # Binary classification
+            loss = self.criterion(logits, y.float())
+            preds = torch.sigmoid(logits)
+            predicted_classes = (preds > 0.5).float()
+            acc = (predicted_classes == y).float().mean()
+            l.append({"y": y.cpu().numpy(), "pre": preds.detach().cpu().numpy()})
+            return loss
+        else:
+            # Multiclass classification
+            loss = self.criterion(logits, y.long())
+            preds = torch.softmax(logits, dim=1)
+            predicted_classes = torch.argmax(preds, dim=1)
+            acc = (predicted_classes == y).float().mean()
+            l.append({"y": y.cpu().numpy(), "pre": preds.detach().cpu().numpy()})
+            return loss
+
+    def training_step(self, batch, batch_idx):
+        return self.shared_step(batch, "train", self.training_step_outputs)
+
+    def validation_step(self, batch, batch_idx):
+        self.shared_step(batch, "val", self.val_step_outputs)
+
+    def on_train_epoch_end(self):
+        self.training_step_outputs.clear()
+
+    def on_validation_epoch_end(self):
+        preds = np.concatenate([x["pre"] for x in self.val_step_outputs], axis=0)
+        trues = np.concatenate([x["y"] for x in self.val_step_outputs], axis=0)
+        if self.regression:
+            # For regression, print MSE
+            mse = np.mean((preds - trues) ** 2)
+            print("val_mse", mse)
+        elif self.num_classes == 1:
+            from sklearn.metrics import auc, precision_recall_curve, roc_auc_score
+
+            precision, recall, thresholds = precision_recall_curve(trues, preds)
+            aupr = auc(recall, precision)
+            auroc = roc_auc_score(trues, preds)
+            print("val_aupr", aupr, "val_auroc", auroc)
+        else:
+            from sklearn.metrics import accuracy_score, log_loss
+
+            acc = accuracy_score(trues, np.argmax(preds, axis=1))
+            ce = log_loss(trues, preds)
+            print("val_acc", acc, "val_ce", ce)
+        self.val_step_outputs.clear()
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=1e-4, weight_decay=1e-5)

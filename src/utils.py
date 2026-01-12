@@ -1,5 +1,8 @@
 import json
 import os
+import pickle
+import random
+import re
 from typing import List
 
 import mrcfile
@@ -39,10 +42,11 @@ int_colors = [
     "#03a678",
     "#f5f5f5",
     "#ff5733",
+    "#000000",
 ]
 
 
-def drawannotation(image, target, box=True, mask=True, font_size=30):
+def drawannotation(image, target, box=True, mask=True, font_size=30, color=None):
     import matplotlib.pyplot as plt
     from torchvision.utils import draw_bounding_boxes, draw_segmentation_masks
 
@@ -51,15 +55,20 @@ def drawannotation(image, target, box=True, mask=True, font_size=30):
         # if np.max(image) < 10:
         image -= torch.min(image)
         image /= torch.max(image)
-        image = torch.tensor(image * 255).type(torch.uint8)
+        # image = torch.tensor(image * 255).type(torch.uint8)
+        image = (image * 255).type(torch.uint8)
 
     if "masks" in target and mask:
         print("masks")
+        if target["masks"].dim() > 3:
+            target["masks"] = target["masks"].squeeze()
+        if target["masks"].dtype != torch.bool:
+            target["masks"] = target["masks"] > 0.5
         annotated_tensor = draw_segmentation_masks(
             image=image,
             masks=target["masks"],
             alpha=0.5,
-            # colors=[int_colors[i] for i in target["class_labels"]],
+            colors=[int_colors[i] for i in target["class_labels"]],
         )
     else:
         annotated_tensor = image
@@ -67,16 +76,37 @@ def drawannotation(image, target, box=True, mask=True, font_size=30):
     # Annotate the sample image with labels and bounding boxes
     # if "names" in target:
     if box:
+        if color is not None:
+            color = [int_colors[color]] * len(target["bboxes"])
+        b = target["bboxes"]
+        b[:, 2:] += 5
+        b[:, :2] -= 5
         annotated_tensor = draw_bounding_boxes(
             image=annotated_tensor,
-            boxes=target["bboxes"],
-            labels=target["names"] if "names" in target else target["labels"],
-            font_size=font_size,
+            boxes=b,  # target["bboxes"],
+            # labels=target["names"] if "names" in target else target["labels"],
+            # font_size=font_size,
             width=5,
+            colors="blue",
             # colors=[int_colors[i] for i in target["class_labels"]],
         )
+
     res = annotated_tensor.numpy()
     plt.imshow(np.moveaxis(res, 0, -1))
+    for i in range(len(target["bboxes"])):
+        box = target["bboxes"][i]
+        if "names" in target:
+            name = target["names"][i]
+        else:
+            name = str(target["labels"][i])
+        plt.text(
+            box[0] + 10,
+            box[1] + 10,
+            name,
+            color="red",
+            fontsize=font_size,
+            # bbox=dict(facecolor="red", alpha=0.5),
+        )
 
 
 def mask_iou(mask1, mask2):
@@ -266,9 +296,10 @@ def processSingle(model, label, data, target_size, thres, has_none, empty=5):
     l = []
     item_ids = []
     masks = []
+    model.eval()
     output = model(
-        pixel_values=data["pixel_values"].unsqueeze(0).float(),
-        pixel_mask=data["pixel_mask"].unsqueeze(0).float(),
+        pixel_values=data["pixel_values"].unsqueeze(0).float().to(model.device),
+        pixel_mask=data["pixel_mask"].unsqueeze(0).float().to(model.device),
     )
     # for idx, i in enumerate(model_names):
     #     # print(i)
@@ -292,6 +323,9 @@ def processSingle(model, label, data, target_size, thres, has_none, empty=5):
         reserve = reserve > thres
         reserve = reserve.any(dim=1)
 
+    if label["class_labels"] is not None and len(label["class_labels"]) == 0:
+        label["class_labels"] = None
+
     if label["class_labels"] is not None:
         o = {}
         o["pred_boxes"] = pred_boxes.unsqueeze(0)
@@ -301,7 +335,7 @@ def processSingle(model, label, data, target_size, thres, has_none, empty=5):
         r = torch.zeros_like(reserve, dtype=torch.bool)
         r[match_res[0]] = True
         reserve2 = reserve | r
-        print("check whether reserve ", sum(reserve), sum(reserve2))
+        # print("check whether reserve ", sum(reserve), sum(reserve2))
         reserve = reserve2
     # else:
     #     reserve = v > thres
@@ -314,7 +348,11 @@ def processSingle(model, label, data, target_size, thres, has_none, empty=5):
 
     pos = torch.zeros((pred_boxes.shape[0], 5))
     pos[:, 0] = label["pos"]
+    # if label["pos"] > 249 and label["pos"] < 255:
+    #     print(label["pos"])
     if "zposmax" in label:
+        if label["zposmax"] == 0:
+            label["zposmax"] = 500
         pos[:, 0] /= label["zposmax"]
     else:
         pos[:, 0] /= 500
@@ -351,7 +389,7 @@ def processSingle(model, label, data, target_size, thres, has_none, empty=5):
 
             boxes[match_res[0]] = target_boxes
             box_mask[match_res[0]] = True
-            print(box_mask.shape, boxes.shape)
+            # print(box_mask.shape, boxes.shape)
             targets[match_res[0]] = target
 
             if "masks" in label:
@@ -377,6 +415,8 @@ def buildStage2(
     dataset,
     target_size,
     thres,
+    offset=0,
+    gap=5,
     # model_names=["other", "ribo"],
     has_none=False,
     empty=5,
@@ -403,12 +443,12 @@ def buildStage2(
         "sample_mapping": sample_mapping,
     }
     cnts = 0
-    for i in range(len(dataset)):
-        print("slice", i)
+    for i in tqdm(range(dataset.start_pos + offset, dataset.end_pos, gap)):
+        # print("slice", i)
         if seed is not None:
-            data = dataset.__getitem__(i, seed=seed)
+            data = dataset.__getitem__(pos=i, seed=seed)
         else:
-            data = dataset.__getitem__(i)
+            data = dataset.__getitem__(pos=i)
         label = data["labels"]
         with torch.no_grad():
             _ret_dict = processSingle(
@@ -425,8 +465,8 @@ def buildStage2(
                 sample_mapping[cnts] = len(ret_dict["images"]) - 1
                 cnts += 1
 
-        print("obj_cnts:", cnts)
-
+        # print("obj_cnts:", cnts)
+    print("finish dataset")
     ret_dict["feature"] = torch.cat(ret_dict["feature"], dim=0)
     ret_dict["label"] = torch.cat(ret_dict["label"], dim=0)
     ret_dict["box_mask"] = torch.cat(ret_dict["box_mask"], dim=0)
@@ -444,7 +484,74 @@ def buildStage2(
     # return ret, l
 
 
-def process(outputs, labels, empty=5, need_mask=False):
+def process_stage1(outputs, labels):
+    logits = outputs["logits"]
+    device = logits.device
+    for l in range(len(labels)):
+        for i in ["class_labels", "boxes", "masks"]:
+            if i in labels[l]:
+                labels[l][i] = labels[l][i].to(device)
+
+    match_res = matcher(outputs, labels)
+
+    _, num_obj, obj_num = logits.shape
+    pred_boxes = outputs["pred_boxes"]
+    label = labels[0]
+    # print(label)
+    # print(label.keys())
+    embed = outputs["last_hidden_state"][0]
+    targets = torch.zeros((num_obj), dtype=torch.long).to(device)
+    targets.fill_(obj_num)
+    targets[match_res[0][0]] = label["class_labels"][match_res[0][1]]
+    box_mask = torch.zeros((num_obj), dtype=torch.long).to(device)
+    box_mask.fill_(-1)
+    t = torch.arange(0, len(match_res[0][0])).long().to(device)
+    box_mask[match_res[0][0]] = t
+    # boxes = torch.zeros((num_obj, 4)).to(device)
+    # boxes[match_res[0][0]] = label["boxes"][match_res[0][1]]
+    masks = label["masks"][match_res[0][1]]
+
+    return {
+        "masks": masks,
+        "feature": embed,
+        "label": targets,
+        "pred_boxes": pred_boxes[0].detach(),
+        "obj_pos": box_mask,
+    }
+
+
+def unique_random_sample_indices(weights, num_samples):
+    """
+    Randomly sample up to `num_samples` elements from a list based on weights
+    without replacement, and return the indices of the selected elements.
+    Elements with a weight of 0 are excluded from sampling.
+
+    Args:
+        elements (list): List of elements to sample from.
+        weights (list): List of weights corresponding to each element.
+        num_samples (int): The number of samples to select.
+
+    Returns:
+        list: Indices of the selected elements.
+    """
+    # Filter elements with weights > 0
+    filtered_indices = [i for i, w in enumerate(weights) if w > 0]
+
+    # If no elements have a valid weight, return an empty list
+    if not filtered_indices:
+        return []
+
+    # If there aren't enough valid elements, return all valid indices
+    if len(filtered_indices) <= num_samples:
+        return filtered_indices
+
+    # Otherwise, randomly sample indices from the valid ones
+    sampled_indices = random.sample(population=filtered_indices, k=num_samples)
+
+    return sampled_indices
+
+
+def process(outputs, labels, empty=4, need_mask=False):
     ret = []
     boxeses = []
     box_masks = []
@@ -466,7 +573,7 @@ def process(outputs, labels, empty=5, need_mask=False):
         if "zposmax" in label:
             pos[:, 0] /= label["zposmax"]
         else:
-            pos[:, 0] /= 500
+            pos[:, 0] /= 500.0
         pos[:, 1:5] = pred_boxes[i][:, 0:4]
 
         logit = logits[i]
@@ -483,7 +590,7 @@ def process(outputs, labels, empty=5, need_mask=False):
             t = torch.arange(0, len(match_res[i][0])).long().to(device)
             box_mask[match_res[i][0]] = t + cnts
             cnts += len(match_res[i][0])
-        if need_mask and "masks" in label:
+        if need_mask and "masks" in label and (i == slice_num // 2):
             mask.append(label["masks"][match_res[i][1]])
         boxes = torch.zeros((num_obj, 4)).to(device)
         boxes[match_res[i][0]] = label["boxes"][match_res[i][1]]
@@ -503,7 +610,10 @@ def process(outputs, labels, empty=5, need_mask=False):
     boxeses = torch.cat(boxeses, dim=0)
     item_ids = [i for j in item_ids for i in j]
     if need_mask:
+        # print(mask)
         mask = torch.cat(mask, dim=0)
+        # print(mask.shape)
+        # print(mask)
         # print(cnts, mask.shape)
         return {
             "feature": ret,
@@ -531,22 +641,61 @@ def get_iou(X):
     return iou
 
 
+# def get_neighbors(
+#     X, z_thres1=0.03, z_thres2=0.5, iou_thres=0.4, num_classes=5, obj_thres=0.2
+# ):
+#     X2 = X[:, 1:5].clone()
+#     # expand a little so that boxes may overlap
+#     X2[:, 2:] += 0.05
+
+#     iou, _ = modules.box_iou(center_to_corners_format(X2), center_to_corners_format(X2))
+#     x, y = torch.where(iou > 0.01)
+
+#     obj = X[:, 5 : 5 + num_classes] > obj_thres
+#     obj = obj.any(dim=1)
+
+#     iou -= 1 - obj.float()
+#     iou = iou.T
+#     iou -= 1 - obj.float()
+
+#     zposx = X[:, 0][x]
+#     zposy = X[:, 0][y]
+#     x = x[torch.abs(zposx - zposy) < z_thres1]
+#     y = y[torch.abs(zposx - zposy) < z_thres1]
+
+#     x1, y1 = torch.where(iou > iou_thres)
+#     zposx = X[:, 0][x1]
+#     zposy = X[:, 0][y1]
+#     need = (zposx != zposy) & (torch.abs(zposx - zposy) < z_thres2)
+#     x1 = x1[need]
+#     y1 = y1[need]
+#     x = torch.cat([x, x1])
+#     y = torch.cat([y, y1])
+#     return x, y
+
+
 def get_neighbors(
-    X, z_thres1=0.03, z_thres2=0.5, iou_thres=0.4, num_classes=5, obj_thres=0.2
+    X, z_thres1=0.001, z_thres2=0.5, iou_thres=0.4, num_classes=4, obj_thres=0.2
 ):
     X2 = X[:, 1:5].clone()
     # expand a little so that boxes may overlap
-    X2[:, 2:] += 0.05
-
+    # X2[:, 2:] += 0.05
+    # print("calculate node iou")
+    # with open("/home/feity/cryoem/temp/results/iou.pt", "wb") as f:
+    #     pickle.dump(X2, f)
     iou, _ = modules.box_iou(center_to_corners_format(X2), center_to_corners_format(X2))
-    x, y = torch.where(iou > 0.01)
-
-    obj = X[:, 5 : 5 + num_classes] > obj_thres
+    # print("calculate node iou done")
+    obj = X[:, 5 : 5 + num_classes]
+    # print(obj)
+    obj = torch.sigmoid(obj)  # .float()
+    obj = obj > obj_thres
     obj = obj.any(dim=1)
 
     iou -= 1 - obj.float()
     iou = iou.T
     iou -= 1 - obj.float()
+
+    x, y = torch.where(iou > 0.01)
 
     zposx = X[:, 0][x]
     zposy = X[:, 0][y]
@@ -559,9 +708,12 @@ def get_neighbors(
     need = (zposx != zposy) & (torch.abs(zposx - zposy) < z_thres2)
     x1 = x1[need]
     y1 = y1[need]
-    x = torch.cat([x, x1])
-    y = torch.cat([y, y1])
-    return x, y
+    # print(len(x), len(y), len(x1), len(y1))
+    x1 = torch.cat([x, x1])
+    y1 = torch.cat([y, y1])
+    z = torch.ones_like(x1, dtype=torch.bool, requires_grad=False)
+    z[: len(x)] = False
+    return x1, y1, z
 
     # dis = 1 - iou
     # t = t.numpy().copy()
@@ -598,12 +750,12 @@ def get_neighbors(
 
 
 def convertStage2Dataset(
-    retdict, z_thres1=0.01, z_thres2=0.1, iou_thres=0.4, num_classes=5, obj_thres=0.2
+    retdict, z_thres1=0.0001, z_thres2=0.1, iou_thres=0.4, num_classes=4, obj_thres=0.2
 ):
     X = retdict["feature"]
 
     # print("building up neighboring graph")
-    xs, ys = get_neighbors(
+    xs, ys, edge_type = get_neighbors(
         X.clone().detach(),
         z_thres1=z_thres1,
         z_thres2=z_thres2,
@@ -620,16 +772,18 @@ def convertStage2Dataset(
     boxes = retdict["boxes"]
     item_ids = retdict["item_id"]
 
-    item_mapping = {"": -1}
-    for i in item_ids:
-        if i not in item_mapping:
-            item_mapping[i] = len(item_mapping)
-    item_ids = [item_mapping[i] for i in item_ids]
-    item_ids = torch.tensor(item_ids, dtype=torch.long).to(X.device)
-    item_idx = item_ids[xs]
-    item_idy = item_ids[ys]
-    edge_label = (item_idx == item_idy) & (item_idx != -1)
-    edge_label = edge_label.long()
+    # item_mapping = {"": -1}
+    # ids = []
+    # for i in item_ids:
+    #     if i not in item_mapping:
+    #         item_mapping[i] = len(item_mapping)
+    #     ids.append(item_mapping[i])
+    # item_ids = [item_mapping[i] for i in item_ids]
+    # item_ids = torch.tensor(item_ids, dtype=torch.long).to(X.device)
+    # item_idx = item_ids[xs]
+    # item_idy = item_ids[ys]
+    # edge_label = (item_idx == item_idy) & (item_idx != -1)
+    # edge_label = edge_label.long()
     # source = []
     # dest = []
     # edge_label = []
@@ -644,14 +798,115 @@ def convertStage2Dataset(
     # print(edges.shape)
 
     t = Data(x=X, edge_index=edges, y=y)
+    t.inter_edges = edge_type
     t.box_masks = box_masks
     t.boxes = boxes
-    t.edge_label = edge_label  # torch.tensor(edge_label, dtype=torch.long)
-    if "sample_mapping" in retdict:
-        t.sample_mapping = torch.tensor(
-            [i for i in retdict["sample_mapping"].values()], dtype=int
-        )
+    t.item_id = item_ids
+    # t.edge_label = edge_label  # torch.tensor(edge_label, dtype=torch.long)
+    # if "sample_mapping" in retdict:
+    #     t.sample_mapping = torch.tensor(
+    #         [i for i in retdict["sample_mapping"].values()], dtype=int
+    #     )
     return t
+
+
+# def get_neighbors(
+#     X, z_thres1=0.01, z_thres2=0.15, iou_thres=0.4, num_classes=5, obj_thres=0.1
+# ):
+#     X2 = X[:, 1:5].clone()
+#     # expand a little so that boxes may overlap
+#     X2[:, 2:] +=0.05
+
+#     iou, _ = modules.box_iou(center_to_corners_format(X2), center_to_corners_format(X2))
+
+#     obj = X[:, 5 : 5 + num_classes]
+#     obj = torch.sigmoid(obj)
+#     obj = obj > obj_thres
+#     obj = obj.any(dim=1)
+
+#     # queries with less than obj_thres are not considered
+#     iou -= 2 - 2 * obj.float()
+#     iou = iou.T
+#     iou -= 2 - 2 * obj.float()
+
+#     # remove self-edges
+#     # iou -= torch.eye(iou.shape[0], dtype=torch.float32, device=X.device)
+#     zpos = X[:, 0]
+#     zpos_same = (zpos[:, None] == zpos[None, :]).float()
+#     iou += zpos_same
+
+#     x, y = torch.where(iou > 0.01)
+#     zposx = X[:, 0][x]
+#     zposy = X[:, 0][y]
+#     x = x[torch.abs(zposx - zposy) < z_thres1]
+#     y = y[torch.abs(zposx - zposy) < z_thres1]
+
+#     x1, y1 = torch.where(iou > iou_thres)
+#     zposx = X[:, 0][x1]
+#     zposy = X[:, 0][y1]
+#     need = (zposx != zposy) & (torch.abs(zposx - zposy) < z_thres2)
+#     x1 = x1[need]
+#     y1 = y1[need]
+#     x = torch.cat([x, x1])
+#     y = torch.cat([y, y1])
+#     return x, y
+
+
+# def convertStage2Dataset(
+#     retdict, z_thres1=0.01, z_thres2=0.15, iou_thres=0.4, num_classes=5, obj_thres=0.2
+# ):
+#     X = retdict["feature"]
+
+#     # print("building up neighboring graph")
+#     xs, ys = get_neighbors(
+#         X.clone().detach(),
+#         z_thres1=z_thres1,
+#         z_thres2=z_thres2,
+#         iou_thres=iou_thres,
+#         obj_thres=obj_thres,
+#         num_classes=num_classes,
+#     )
+#     # print(xs, ys, len(xs), len(ys))
+
+#     # print("building up neighboring graph done")
+
+#     y = retdict["label"]
+#     box_masks = retdict["box_mask"]
+#     boxes = retdict["boxes"]
+#     # item_ids = retdict["item_id"]
+
+#     # item_mapping = {"": -1}
+#     # for i in item_ids:
+#     #     if i not in item_mapping:
+#     #         item_mapping[i] = len(item_mapping)
+#     # item_ids = [item_mapping[i] for i in item_ids]
+#     # item_ids = torch.tensor(item_ids, dtype=torch.long).to(X.device)
+#     # item_idx = item_ids[xs]
+#     # item_idy = item_ids[ys]
+#     # edge_label = (item_idx == item_idy) & (item_idx != -1)
+#     # edge_label = edge_label.long()
+#     # source = []
+#     # dest = []
+#     # edge_label = []
+#     # for i, j in zip(xs, ys):
+#     #     source.append(i)
+#     #     dest.append(j)
+#     #     if item_ids[i] == item_ids[j] and item_ids[i] != "":
+#     #         edge_label.append(1)
+#     #     else:
+#     #         edge_label.append(0)
+#     edges = torch.stack([xs, ys])
+#     # print(edges.shape)
+
+#     t = Data(x=X, edge_index=edges, y=y)
+#     t.box_masks = box_masks
+#     t.boxes = boxes
+#     # t.edge_label = edge_label  # torch.tensor(edge_label, dtype=torch.long)
+#     # if "sample_mapping" in retdict:
+#     #     t.sample_mapping = torch.tensor(
+#     #         [i for i in retdict["sample_mapping"].values()], dtype=int
+#     #     )
+#     return t
 
 
 # helper functions for model building
@@ -748,21 +1003,24 @@ def buildModel(configs, args, checkpoint=None):
 
 def getModel(configs):
 
+    if "stage" not in configs["model"]:
+        configs["model"]["stage"] = "stage 1"
+
     if "checkpoint" not in configs["model"]:
         configs["model"]["checkpoint"] = None
 
-    if isinstance(configs["data"]["require_mask"], dict):
+    # if isinstance(configs["data"]["require_mask"], dict):
 
-        models = {}
+    #     models = {}
 
-        for i in configs["model"]["args"]:
-            models[i] = buildModel(
-                configs, configs["model"]["args"][i], configs["model"]["checkpoint"]
-            )
-    else:
-        models = buildModel(
-            configs, configs["model"]["args"], configs["model"]["checkpoint"]
-        )
+    #     for i in configs["model"]["args"]:
+    #         models[i] = buildModel(
+    #             configs, configs["model"]["args"][i], configs["model"]["checkpoint"]
+    #         )
+    # else:
+    models = buildModel(
+        configs, configs["model"]["args"], configs["model"]["checkpoint"]
+    )
 
     if "lr_backbone" not in configs["training"]:
         configs["training"]["lr_backbone"] = None
@@ -773,20 +1031,47 @@ def getModel(configs):
     if "dropout" not in configs["model"]:
         configs["model"]["dropout"] = False
 
-    if "additional_input_dim" not in configs["model"]:
-        configs["model"]["additional_input_dim"] = 20
-
     if "scheduler_step" not in configs["training"]:
         configs["training"]["scheduler_step"] = -1
 
     if "warmup_epoches" not in configs["training"]:
-        configs["training"]["warmup_epoches"] = 0
+        configs["training"]["warmup_epoches"] = 1
 
     if "pick_num" not in configs["training"]:
-        configs["training"]["pick_num"] = 6
+        configs["training"]["pick_num"] = 8
 
     if "mask_alpha" not in configs["training"]:
-        configs["training"]["mask_alpha"] = 0.8
+        configs["training"]["mask_alpha"] = 0.5
+
+    if "mask_in_channel" not in configs["model"]:
+        configs["model"]["mask_in_channel"] = 3
+
+    if "mask_out_channel" not in configs["model"]:
+        configs["model"]["mask_out_channel"] = 1
+
+    if "class_weight" not in configs["model"]:
+        configs["model"]["class_weight"] = None
+
+    if "consistency_regularization_coef" not in configs["model"]:
+        configs["model"]["consistency_regularization_coef"] = 0.5
+
+    if "box_head" not in configs["model"]:
+        configs["model"]["box_head"] = "lora"
+
+    if "feature_dim" not in configs["model"]:
+        configs["model"]["feature_dim"] = 256
+
+    if "C_in" not in configs["model"]:
+        configs["model"]["C_in"] = (
+            configs["model"]["feature_dim"] + configs["model"]["output_dim"] + 4
+        )
+    # print(configs["model"]["feature_dim"], configs["model"]["C_in"])
+
+    if "lr" not in configs["training"]:
+        configs["training"]["lr"] = 1e-4
+
+    if "weight_decay" not in configs["training"]:
+        configs["training"]["weight_decay"] = 0.0
 
     model = modules.DetrModel(
         configs["model"]["stage"],
@@ -796,7 +1081,7 @@ def getModel(configs):
         lr_detr=configs["training"]["lr_detr"],
         weight_decay=configs["training"]["weight_decay"],
         feature_dim=configs["model"]["feature_dim"],
-        additional_input_dim=configs["model"]["additional_input_dim"],
+        gnn_in_channel=configs["model"]["C_in"],
         output_dim=configs["model"]["output_dim"],
         layer_type=configs["model"]["layer_type"],
         dropout=configs["model"]["dropout"],
@@ -804,6 +1089,13 @@ def getModel(configs):
         warmup_epoches=configs["training"]["warmup_epoches"],
         pick_num=configs["training"]["pick_num"],
         mask_alpha=configs["training"]["mask_alpha"],
+        mask_in_channel=configs["model"]["mask_in_channel"],
+        mask_out_channel=configs["model"]["mask_out_channel"],
+        class_weights=configs["model"]["class_weight"],
+        consistency_regularization_coef=configs["model"][
+            "consistency_regularization_coef"
+        ],
+        box_head=configs["model"]["box_head"],
     )
 
     if "load" in configs["model"] and configs["model"]["load"] is not None:
@@ -847,7 +1139,7 @@ def loadModel(path, checkpoint="last.ckpt"):
         configs = json.load(f)
 
     model = getModel(configs)
-
+    # print(path, checkpoint)
     ckpt = torch.load(os.path.join(path, checkpoint), map_location="cpu")["state_dict"]
 
     p = list(model.state_dict().keys())  # [j for j, _ in model.named_parameters()]
@@ -1120,3 +1412,29 @@ def cal_ap(df, target_df, iou_thresholds=[0.5, 0.75]):
 def readTomogram(filename):
     with mrcfile.open(filename, permissive=True) as m:
         return m.data
+
+
+def pickAndLoadBest(model, path):
+    pattern = re.compile(
+        r"epoch=(\d+)"
+        r"(?:-total_validate_auroc=([0-9.]+))?"
+        r"-total_validate_loss=([0-9.]+)"
+        r"(?:-v(\d+))?"
+        r"\.ckpt$"
+    )
+    for i in os.listdir(path):
+        best = ""
+        loss_best = 1e100
+        if i.endswith(".ckpt"):
+            m = pattern.match(i)
+            if m is not None:
+                epoch = int(m.group(1))
+                auroc = float(m.group(2)) if m.group(2) is not None else 0
+                loss = float(m.group(3))
+                v = int(m.group(4)) if m.group(4) is not None else 0
+                if loss_best > loss:
+                    loss_best = loss
+                    best = i
+    a = torch.load(os.path.join(path, best), map_location="cpu")["state_dict"]
+    model.load_state_dict(a, strict=False)
+    return model
