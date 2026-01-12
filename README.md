@@ -88,14 +88,14 @@ python scripts/train_full.py -p /path/to/experiment -d 0
 - Use `utils.drawannotation(img, labels)` to overlay bounding boxes and class labels per slice.
 - Notebook cells demonstrate per-slice visualization and mask previews (raw sigmoid vs refined binary).
 
-## Tips & Troubleshooting
+<!-- ## Tips & Troubleshooting
 - Ensure the label volume aligns spatially with the raw tomogram when building datasets.
 - Sparse masks (`csr_matrix`) reduce memory usage for large volumes.
 - Tune DBSCAN (`eps`, `min_samples`, `dis_penalty_coef`) per dataset scale.
-- For CUDA issues, verify `nvidia-smi` and match your PyTorch CUDA version.
+- For CUDA issues, verify `nvidia-smi` and match your PyTorch CUDA version. -->
 
-## Citation
-If you use tomoGNN in your research, please cite this repository. A formal citation will be added when a manuscript/preprint is available.
+<!-- ## Citation
+If you use tomoGNN in your research, please cite this repository. A formal citation will be added when a manuscript/preprint is available. -->
 
-## License
-Please consult the repository owner regarding licensing if you plan to redistribute or modify substantial portions of this codebase.
+<!-- ## License
+Please consult the repository owner regarding licensing if you plan to redistribute or modify substantial portions of this codebase. -->
