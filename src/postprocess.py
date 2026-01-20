@@ -34,6 +34,7 @@ def generatedf(
     filter_prob=0.05,
     return_mask=False,
     return_embeds=False,
+    max_edges=25,
 ):
     # silence dubugging outputs
     # saved_stdout = sys.stdout
@@ -66,7 +67,7 @@ def generatedf(
             if return_mask:
                 all_masks.append(retdict["masks"])
             graph = utils.convertStage2Dataset(
-                retdict, num_classes=num_classes, obj_thres=0.1
+                retdict, num_classes=num_classes, obj_thres=0.1, max_edges=max_edges
             )
             print("build graph")
             graphs.append(graph)

@@ -675,7 +675,13 @@ def get_iou(X):
 
 
 def get_neighbors(
-    X, z_thres1=0.001, z_thres2=0.5, iou_thres=0.4, num_classes=4, obj_thres=0.2
+    X,
+    z_thres1=0.001,
+    z_thres2=0.5,
+    iou_thres=0.4,
+    num_classes=4,
+    obj_thres=0.2,
+    max_edges=None,
 ):
     X2 = X[:, 1:5].clone()
     # expand a little so that boxes may overlap
@@ -694,15 +700,29 @@ def get_neighbors(
     iou -= 1 - obj.float()
     iou = iou.T
     iou -= 1 - obj.float()
-
-    x, y = torch.where(iou > 0.01)
+    if max_edges is None:
+        x, y = torch.where(iou > 0.01)
+    else:
+        values, indices = torch.topk(iou, k=min(max_edges, iou.shape[1]), dim=1)
+        mask = values > 0.01
+        x = torch.arange(0, iou.shape[0]).unsqueeze(1).repeat(1, values.shape[1])
+        x = x[mask]
+        y = indices[mask]
 
     zposx = X[:, 0][x]
     zposy = X[:, 0][y]
     x = x[torch.abs(zposx - zposy) < z_thres1]
     y = y[torch.abs(zposx - zposy) < z_thres1]
 
-    x1, y1 = torch.where(iou > iou_thres)
+    if max_edges is None:
+        x1, y1 = torch.where(iou > iou_thres)
+    else:
+        values, indices = torch.topk(iou, k=min(max_edges, iou.shape[1]), dim=1)
+        mask = values > iou_thres
+        x1 = torch.arange(0, iou.shape[0]).unsqueeze(1).repeat(1, values.shape[1])
+        x1 = x1[mask]
+        y1 = indices[mask]
+
     zposx = X[:, 0][x1]
     zposy = X[:, 0][y1]
     need = (zposx != zposy) & (torch.abs(zposx - zposy) < z_thres2)
@@ -750,7 +770,13 @@ def get_neighbors(
 
 
 def convertStage2Dataset(
-    retdict, z_thres1=0.0001, z_thres2=0.1, iou_thres=0.4, num_classes=4, obj_thres=0.2
+    retdict,
+    z_thres1=0.0001,
+    z_thres2=0.1,
+    iou_thres=0.4,
+    num_classes=4,
+    obj_thres=0.2,
+    max_edges=None,
 ):
     X = retdict["feature"]
 
@@ -762,6 +788,7 @@ def convertStage2Dataset(
         iou_thres=iou_thres,
         obj_thres=obj_thres,
         num_classes=num_classes,
+        max_edges=max_edges,
     )
     # print(xs, ys, len(xs), len(ys))
 
