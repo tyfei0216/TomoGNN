@@ -2,7 +2,7 @@
 
 This script orchestrates model training using PyTorch Lightning with TensorBoard
 logging and checkpointing. It runs up to two stages:
-
+gan
 - Stage 1 (mask): trains with slice masks available in the dataset to learn
   robust features. Config keys under `model` and `training` are adjusted for
   this stage (e.g., learning rates, scheduler step, mask channels).

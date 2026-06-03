@@ -215,7 +215,7 @@ def processClass(
         #     torch.tensor(r["class_value"].values),
         #     np.array(["same" for i in range(len(r))]),
         # )
-        keep = torchvision.ops.nms(
+        keep  = torchvision.ops.nms(
             utils.convertBoxes(torch.tensor(r[["x", "y", "w", "h"]].values)),
             torch.tensor(r["class_value"].values),
             nms,

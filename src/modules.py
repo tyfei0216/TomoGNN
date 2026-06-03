@@ -1679,6 +1679,8 @@ class ParticleID3DNet_Binary(L.LightningModule):
             aupr = auc(recall, precision)
             auroc = roc_auc_score(trues, preds)
             print("val_aupr", aupr, "val_auroc", auroc)
+            print("logging")
+            self.log("val_auroc", auroc)
         else:
             from sklearn.metrics import accuracy_score, log_loss
 

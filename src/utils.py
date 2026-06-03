@@ -551,7 +551,8 @@ def unique_random_sample_indices(weights, num_samples):
     return sampled_indices
 
 
-def process(outputs, labels, empty=4, need_mask=False):
+
+def process(outputs, labels, empty=4, need_mask=False, nms = -1.0):
     ret = []
     boxeses = []
     box_masks = []
@@ -567,6 +568,7 @@ def process(outputs, labels, empty=4, need_mask=False):
 
     cnts = 0
     for i in range(slice_num):
+        
         label = labels[i]
         pos = torch.zeros((num_obj, 5)).to(device)
         pos[:, 0] = label["pos"]
