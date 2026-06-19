@@ -20,6 +20,7 @@ from sklearn.metrics import (
 )
 
 import utils
+from tqdm import tqdm 
 
 
 def generatedf(
@@ -99,6 +100,116 @@ def generatedf(
         return alldfs, graphs, all_masks.detach().cpu().numpy()
     return alldfs, graphs
 
+
+def generatedfBySlice(
+    model,
+    dataset,
+    gap,
+    columns,
+    has_none=False,
+    empty=4,
+    num_classes=4,
+    z_multiply=500,
+    length=15,
+    return_mask=False,
+    return_embeds=False,
+):
+    t = [
+        "z",
+        "x",
+        "y",
+        "w",
+        "h",
+    ]
+    t.extend(columns)
+    with torch.no_grad():
+        alldfs = []
+        # graphs = []
+        all_masks = []
+        embeds = []
+        model.stage = "stage 1"
+        retdict = utils.runStage1(
+            model,
+            dataset,
+            (800, 800),
+            has_none=has_none,
+            empty=empty,
+        )
+        print("finish stage1")
+
+        slice_ids = sorted(retdict.keys())
+        model.stage = "stage 2"
+
+        for slice_id in slice_ids:
+            needIDs, pos = utils.pickout(retdict, slice_id, gap, length)
+            center_id = needIDs[pos]
+
+            merged = {
+                "feature": [],
+                "label": [],
+                "box_mask": [],
+                "boxes": [],
+                "item_id": [],
+            }
+            if return_mask:
+                merged["masks"] = []
+
+            for need_id in needIDs:
+                if need_id not in retdict:
+                    continue
+                for key in ["feature", "label", "box_mask", "boxes", "item_id"]:
+                    merged[key].extend(retdict[need_id][key])
+                if return_mask and "masks" in retdict[need_id]:
+                    merged["masks"].extend(retdict[need_id]["masks"])
+
+            if len(merged["feature"]) == 0:
+                continue
+            
+            merged["feature"] = torch.cat(merged["feature"], dim=0)
+            merged["label"] = torch.cat(merged["label"], dim=0)
+            merged["box_mask"] = torch.cat(merged["box_mask"], dim=0)
+            merged["boxes"] = torch.cat(merged["boxes"], dim=0)
+
+            graph = utils.convertStage2Dataset(
+                merged,
+                num_classes=num_classes,
+                obj_thres=0.1,
+            )
+            # graphs.append(graph)
+
+            res = model(graph.x, graph.edge_index)
+            slice_mask = torch.round(graph.x[:, 0] * z_multiply).long() == int(center_id)
+            if not torch.any(slice_mask):
+                continue
+
+            prob = torch.softmax(res["predict"], 1)[slice_mask]
+            pred_boxes = res["box"][slice_mask]
+            z = graph.x[slice_mask][:, [0]] * z_multiply
+
+            df = torch.cat([z, pred_boxes, prob], 1)
+            df = pd.DataFrame(df.detach().cpu().numpy(), columns=t)
+            df["z"] = df["z"].round(0).astype(int)
+            subdf = df[columns]
+            df["max"] = subdf.max(axis=1)
+            df["largest"] = subdf.idxmax(axis=1)
+            df["center_slice"] = center_id
+            alldfs.append(df)
+
+            if return_embeds:
+                embeds.append(res["embeddings"][slice_mask].detach().cpu().numpy())
+            if return_mask and len(merged["masks"]) > 0:
+                all_masks.append(torch.cat(merged["masks"], dim=0).detach().cpu())
+
+        alldfs = pd.concat(alldfs, ignore_index=True) if len(alldfs) > 0 else pd.DataFrame(columns=t + ["max", "largest"])
+
+        if return_embeds:
+            embeds = np.concatenate(embeds, 0) if len(embeds) > 0 else np.empty((0,))
+            return alldfs, embeds
+        if return_mask:
+            all_masks = torch.cat(all_masks, 0) if len(all_masks) > 0 else torch.empty(0)
+            return alldfs, all_masks.detach().cpu().numpy()
+
+        return alldfs
 
 def myscan(iou_matrix, zpos, eps=0.6, max_z_diff=2):
     num = iou_matrix.shape[0]

@@ -197,7 +197,11 @@ def run() -> None:
         # if args.checkpoint is not None:
         #     trainer.fit(model, ds, ckpt_path=args.checkpoint)
         # else:
-        trainer.fit(model, ds)
+        if os.path.exists(os.path.join(args.path, "stage1", "last.ckpt")):
+            print("resuming from checkpoint ", os.path.join(args.path, "stage1", "last.ckpt"))
+            trainer.fit(model, ds, ckpt_path=os.path.join(args.path, "stage1", "last.ckpt"))
+        else:
+            trainer.fit(model, ds)
         print("finish training stage 1")
     else:
         print("skip training stage 1")

@@ -357,6 +357,7 @@ class DetrModel(L.LightningModule):
         class_weights=None,
         consistency_regularization_coef=0.5,
         box_head="lora",
+        nms = -1.0
     ):
         super().__init__()
         if isinstance(model, dict):
@@ -388,6 +389,7 @@ class DetrModel(L.LightningModule):
         self.gnn_in_channel = gnn_in_channel
         self.feature_dim = feature_dim
         self.box_head = box_head
+        self.nms = nms
 
         self.acc = torchmetrics.Accuracy(
             task="multiclass", num_classes=output_dim, average="macro"
@@ -405,7 +407,7 @@ class DetrModel(L.LightningModule):
             dropout=dropout,
             box_head=box_head,
         )
-        self.class_weights = class_weights
+        # self.class_weights = class_weights
         if class_weights is not None:
             t = torch.tensor(class_weights, dtype=torch.float32)
         else:
@@ -898,7 +900,7 @@ class DetrModel(L.LightningModule):
             with t():
                 loss, loss_dict, output = self.common_step_stage1(batch[0], True)
                 retdict = utils.process(
-                    output, batch[0]["labels"], empty=self.output_dim - 1
+                    output, batch[0]["labels"], empty=self.output_dim - 1, nms=self.nms
                 )
                 data2 = utils.convertStage2Dataset(
                     retdict, obj_thres=0.15, num_classes=self.output_dim - 1
@@ -1577,10 +1579,10 @@ class VitForMask(nn.Module):
 
 class ParticleID3DNet_Binary(L.LightningModule):
 
-    def __init__(self, num_classes=1, regression=False):
+    def __init__(self, num_classes=1, regression=False, small=False):
         super().__init__()
         self.save_hyperparameters()
-
+        
         # 3D convolutional backbone
         self.conv1 = nn.Conv3d(1, 16, kernel_size=5, padding=2)
         self.bn1 = nn.BatchNorm3d(16)
@@ -1595,9 +1597,13 @@ class ParticleID3DNet_Binary(L.LightningModule):
         self.conv3_1 = nn.Conv3d(64, 64, kernel_size=5, padding=2)
 
         self.pool = nn.MaxPool3d(2)
-
-        # After 3 poolings: 65 -> 32 -> 16 -> 8
-        self.fc1 = nn.Linear(64 * 8 * 8 * 8, 128)
+        
+        if not small:
+            # After 3 poolings: 65 -> 32 -> 16 -> 8
+            self.fc1 = nn.Linear(64 * 8 * 8 * 8, 128)
+        else:
+            
+            self.fc1 = nn.Linear(64 * 5 * 5 * 5, 128)
 
         self.num_classes = num_classes
         self.regression = regression
@@ -1680,7 +1686,9 @@ class ParticleID3DNet_Binary(L.LightningModule):
             auroc = roc_auc_score(trues, preds)
             print("val_aupr", aupr, "val_auroc", auroc)
             print("logging")
-            self.log("val_auroc", auroc)
+            self.log_dict({"val_auroc":auroc, "val_aupr": aupr})
+            # self.log("val_auroc", auroc)
+            # self.log("val_aupr", aupr)
         else:
             from sklearn.metrics import accuracy_score, log_loss
 
@@ -1691,3 +1699,149 @@ class ParticleID3DNet_Binary(L.LightningModule):
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=1e-4, weight_decay=1e-5)
+
+class Particle3DNet(L.LightningModule):
+    """Residual 3D CNN for multiclass particle identification in tomograms.
+
+    Design:
+    - 6 Conv3D layers total (implemented as 3 residual blocks, each block has 2 convs).
+    - Spatial downsampling by factor 2 after every residual block.
+    - Supports 65^3 and 41^3 inputs in one implementation via adaptive pooling.
+    """
+
+    def __init__(
+        self,
+        num_classes=13,
+        input_size=65,
+        channels=(32, 64, 128),
+        dropout=0.2,
+        lr=2e-4,
+        weight_decay=1e-4,
+        class_weights=None,
+        label_smoothing=0.05,
+    ):
+        super().__init__()
+        self.save_hyperparameters(ignore=["class_weights"])
+
+        if input_size not in (41, 65):
+            raise ValueError("input_size must be either 41 or 65")
+        if len(channels) != 3:
+            raise ValueError("channels must provide 3 stages, e.g. (32, 64, 128)")
+
+        c1, c2, c3 = channels
+        self.num_classes = num_classes
+        self.input_size = input_size
+        self.lr = lr
+        self.weight_decay = weight_decay
+
+        # 6 conv layers in total: 2 convs per block x 3 blocks.
+        self.block1 = Residual3DBlock(1, c1, dropout=dropout)
+        self.block2 = Residual3DBlock(c1, c2, dropout=dropout)
+        self.block3 = Residual3DBlock(c2, c3, dropout=dropout)
+
+        self.pool = nn.MaxPool3d(kernel_size=2, stride=2)
+        self.global_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(c3, c3 // 2),
+            nn.SiLU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(c3 // 2, num_classes),
+        )
+
+        cw = None
+        if class_weights is not None:
+            cw = torch.tensor(class_weights, dtype=torch.float32)
+            if cw.numel() != num_classes:
+                raise ValueError("class_weights length must match num_classes")
+
+        self.register_buffer(
+            "class_weights_buffer",
+            cw if cw is not None else torch.ones(num_classes, dtype=torch.float32),
+            persistent=True,
+        )
+        self.criterion = nn.CrossEntropyLoss(
+            weight=self.class_weights_buffer,
+            label_smoothing=label_smoothing,
+        )
+
+        self.train_acc = torchmetrics.Accuracy(
+            task="multiclass", num_classes=num_classes, average="macro"
+        )
+        self.val_acc = torchmetrics.Accuracy(
+            task="multiclass", num_classes=num_classes, average="macro"
+        )
+        self.val_f1 = torchmetrics.F1Score(
+            task="multiclass", num_classes=num_classes, average="macro"
+        )
+
+    def forward(self, x):
+        if x.dim() != 5:
+            raise ValueError("Expected input of shape (B, C, D, H, W)")
+        if x.shape[1] != 1:
+            raise ValueError("Particle3DNet expects single-channel input (C=1)")
+
+        s = x.shape[-1]
+        if s not in (41, 65):
+            raise ValueError("Particle3DNet supports cubic inputs of 41 or 65")
+
+        x = self.block1(x)
+        x = self.pool(x)
+
+        x = self.block2(x)
+        x = self.pool(x)
+
+        x = self.block3(x)
+        x = self.pool(x)
+
+        x = self.global_pool(x)
+        logits = self.classifier(x)
+        return logits
+
+    def shared_step(self, batch, stage="train"):
+        x, y = batch
+        logits = self(x)
+        y = y.long()
+        loss = self.criterion(logits, y)
+
+        probs = torch.softmax(logits, dim=1)
+        if stage == "train":
+            acc = self.train_acc(probs, y)
+            self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
+            self.log("train_acc", acc, prog_bar=True, on_step=False, on_epoch=True)
+        elif stage == "val":
+            acc = self.val_acc(probs, y)
+            f1 = self.val_f1(probs, y)
+            self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+            self.log("val_acc", acc, prog_bar=True, on_step=False, on_epoch=True)
+            self.log("val_f1", f1, prog_bar=True, on_step=False, on_epoch=True)
+        return loss
+
+    def training_step(self, batch, batch_idx):
+        return self.shared_step(batch, stage="train")
+
+    def validation_step(self, batch, batch_idx):
+        return self.shared_step(batch, stage="val")
+
+    def test_step(self, batch, batch_idx):
+        return self.shared_step(batch, stage="val")
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(
+            self.parameters(), lr=self.lr, weight_decay=self.weight_decay
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=10,
+            T_mult=2,
+            eta_min=self.lr * 0.05,
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+                "frequency": 1,
+            },
+        }

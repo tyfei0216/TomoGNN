@@ -1852,12 +1852,13 @@ class Particle3DDataset(Dataset):
     """
 
     def __init__(
-        self, df, tomo_paths, crop_size=65, norm=None, r=0, if_augmentation=True
+        self, df, tomo_paths, crop_size=65, norm=None, r=0, if_augmentation=True, norm_sample=False
     ):
         self.df = df.reset_index(drop=True)
         self.crop_size = crop_size
         self.norm = norm
         self.r = r
+        self.norm_sample = norm_sample
         self.if_augmentation = if_augmentation
         self.loaded_volumes = {}
         for name in tomo_paths:
@@ -1923,6 +1924,13 @@ class Particle3DDataset(Dataset):
             crop = np.rot90(crop, k=k, axes=(1, 2))
         crop = crop.astype(np.float32)
         crop = np.expand_dims(crop, 0)  # (1, D, H, W)
+        if self.norm_sample:
+            if self.norm == "zscore":
+                crop = (crop - crop.mean()) / (crop.std() + 1e-6)
+            elif self.norm == "hist":
+                from skimage import exposure
+                crop = exposure.equalize_hist(crop[0])[None, ...]  # (1, D, H, W)
+        
         return torch.from_numpy(crop), torch.tensor(label, dtype=torch.float32)
 
 

@@ -46,7 +46,7 @@ int_colors = [
 ]
 
 
-def drawannotation(image, target, box=True, mask=True, font_size=30, color=None):
+def  drawannotation(image, target, box=True, mask=True, font_size=30, color=None):
     import matplotlib.pyplot as plt
     from torchvision.utils import draw_bounding_boxes, draw_segmentation_masks
 
@@ -143,7 +143,9 @@ def nms(threshold, masks, scores, classids):
 
 def bbnms(threshold, boxes, scores, classids):
     allkeep = []
-    for i in np.unique(classids):
+    # print(boxes.shape, scores.shape, classids.shape)
+    for i in torch.unique(classids):
+        # print(i)
         keep = torchvision.ops.nms(
             boxes[classids == i], scores[classids == i], threshold
         )
@@ -289,7 +291,7 @@ from transformers.models.deformable_detr.modeling_deformable_detr import (
 matcher = DeformableDetrHungarianMatcher(1.0, 5.0, 2.0)
 
 
-def processSingle(model, label, data, target_size, thres, has_none, empty=5):
+def processSingle(model, label, data, target_size, thres, has_none, empty=5, nms=-1.0):
     ret = []
     boxeses = []
     box_masks = []
@@ -309,6 +311,10 @@ def processSingle(model, label, data, target_size, thres, has_none, empty=5):
     #         _output = output
     logits = output["logits"].squeeze(0)
     pred_boxes = output["pred_boxes"].squeeze(0)
+    if nms > 0.1:
+        keep = bbnms(nms, convertBoxes(pred_boxes), logits[:, :empty].max(axis=1).values, torch.argmax(logits[:, :empty], axis=1))
+        pred_boxes = pred_boxes[keep]
+        logits = logits[keep]
     if has_none:
         # print(logits, logits.shape)
         prob = torch.softmax(logits, -1)
@@ -408,7 +414,73 @@ def processSingle(model, label, data, target_size, thres, has_none, empty=5):
         "item_id": item_ids,
         "masks": masks,
     }
+    
+def pickout(dict, pos, gap, length, min_id = None, max_id = None):
+    keys = np.array(sorted(dict.keys()))
 
+    if length <= 0 or len(keys) == 0:
+        return [], -1
+
+    if pos not in dict:
+        pos = keys[np.argmin(np.abs(keys - pos))].item()
+
+    center_idx = length // 2
+    start = pos - gap * center_idx
+    if min_id is None:
+        min_id = keys.min().item()
+    if max_id is None:
+        max_id = keys.max().item()
+
+    while start < min_id:
+        start += gap
+
+    end = start + gap * (length - 1)
+    if end > max_id:
+        shift_steps = (end - max_id + gap - 1) // gap
+        start -= shift_steps * gap
+        while start < min_id:
+            start += gap
+
+    needID = []
+    p = start
+    for i in range(length):
+        needID.append(p)
+        p += gap
+        if p > max_id:
+            break
+
+    if pos in needID:
+        pos_idx = needID.index(pos)
+    else:
+        pos_idx = int(np.argmin(np.abs(np.array(needID) - pos)))
+
+    return needID, pos_idx
+
+
+def runStage1(
+    model, 
+    dataset,
+    target_size,
+    has_none=False,
+    empty=5,
+    seed=None,
+    nms = -1.0
+):
+    ret = {}
+    for i in tqdm(range(dataset.start_pos, dataset.end_pos)):
+        if seed is not None:
+            data = dataset.__getitem__(pos=i, seed=seed)
+        else:
+            data = dataset.__getitem__(pos=i)
+        label = data["labels"]
+        with torch.no_grad():
+            _ret_dict = processSingle(
+                model, label, data, target_size, 0.0, has_none, empty, nms
+            )
+
+        ret[i] = _ret_dict
+    # print("finish dataset")
+    return ret
 
 def buildStage2(
     model,
@@ -421,6 +493,7 @@ def buildStage2(
     has_none=False,
     empty=5,
     seed=None,
+    nms = -1.0,
 ):
     ret = []
     l = []
@@ -564,42 +637,55 @@ def process(outputs, labels, empty=4, need_mask=False, nms = -1.0):
     slice_num, num_obj, _ = logits.shape
     pred_boxes = outputs["pred_boxes"]
 
-    match_res = matcher(outputs, labels)
+    # match_res = matcher(outputs, labels)
 
     cnts = 0
     for i in range(slice_num):
-        
+        pred_boxes_i = pred_boxes[i]
+        logits_i = logits[i]
+        embed = outputs["last_hidden_state"][i]
+        if nms > 0.1:
+            # print("using nms")
+            keep = bbnms(nms, convertBoxes(pred_boxes_i), logits_i[:, :empty].max(axis=1).values, torch.argmax(logits_i[:, :empty], axis=1))
+            pred_boxes_i = pred_boxes_i[keep]
+            logits_i = logits_i[keep]
+            embed = embed[keep]
+            # print(pred_boxes_i)
+            # print(logits_i)
+        match_res = matcher({"pred_boxes": pred_boxes_i.unsqueeze(0), "logits": logits_i.unsqueeze(0)}, [labels[i]])
         label = labels[i]
+        num_obj, _ = logits_i.shape
         pos = torch.zeros((num_obj, 5)).to(device)
         pos[:, 0] = label["pos"]
         if "zposmax" in label:
             pos[:, 0] /= label["zposmax"]
         else:
             pos[:, 0] /= 500.0
-        pos[:, 1:5] = pred_boxes[i][:, 0:4]
+        pos[:, 1:5] = pred_boxes_i[:, 0:4]
 
-        logit = logits[i]
-        embed = outputs["last_hidden_state"][i]
+        logit = logits_i
+        # print(pos.shape, logit.shape, embed.shape)
+        
         input = torch.concat([pos, logit, embed], dim=1)
         ret.append(input)
 
         targets = torch.zeros((num_obj), dtype=torch.long).to(device)
         targets.fill_(empty)
-        targets[match_res[i][0]] = label["class_labels"][match_res[i][1]]
+        targets[match_res[0][0]] = label["class_labels"][match_res[0][1]]
         box_mask = torch.zeros((num_obj), dtype=torch.long).to(device)
         box_mask.fill_(-1)
-        if len(match_res[i][0]) > 0:
-            t = torch.arange(0, len(match_res[i][0])).long().to(device)
-            box_mask[match_res[i][0]] = t + cnts
-            cnts += len(match_res[i][0])
+        if len(match_res[0][0]) > 0:
+            t = torch.arange(0, len(match_res[0][0])).long().to(device)
+            box_mask[match_res[0][0]] = t + cnts
+            cnts += len(match_res[0][0])
         if need_mask and "masks" in label and (i == slice_num // 2):
-            mask.append(label["masks"][match_res[i][1]])
+            mask.append(label["masks"][match_res[0][1]])
         boxes = torch.zeros((num_obj, 4)).to(device)
-        boxes[match_res[i][0]] = label["boxes"][match_res[i][1]]
+        boxes[match_res[0][0]] = label["boxes"][match_res[0][1]]
 
         item_id = ["" for i in range(num_obj)]
         if "item_id" in label:
-            for s, t in zip(match_res[i][0], match_res[i][1]):
+            for s, t in zip(match_res[0][0], match_res[0][1]):
                 item_id[s] = label["item_id"][t]
 
         boxeses.append(boxes)
@@ -1101,6 +1187,9 @@ def getModel(configs):
 
     if "weight_decay" not in configs["training"]:
         configs["training"]["weight_decay"] = 0.0
+        
+    if "nms" not in configs["model"]:
+        configs["model"]["nms"] = -1.0
 
     model = modules.DetrModel(
         configs["model"]["stage"],
@@ -1125,6 +1214,7 @@ def getModel(configs):
             "consistency_regularization_coef"
         ],
         box_head=configs["model"]["box_head"],
+        nms=configs["model"]["nms"],
     )
 
     if "load" in configs["model"] and configs["model"]["load"] is not None:
