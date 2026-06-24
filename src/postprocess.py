@@ -253,7 +253,7 @@ def getLabels(
     subdf,
     min_samples=3,
     eps=0.4,
-    dis_penalty_coef=1.0,
+    dis_penalty_coef=0.02,
     dis_penalty_cutoff=2.0,
     cutoff=None,
     enlarge=0.0,
@@ -274,7 +274,8 @@ def getLabels(
     x = subdf[["x", "y", "w", "h"]].values
     if enlarge > 0.0:
         x[:, 2:] += enlarge
-    iou = utils.get_iou(x)
+    iou = utils.get_iou_numpy(x)
+    print("get iou")
     iou = 1 - iou
     mask = subdf["z"].values
     dis_penalty = np.abs(mask[:, None] - mask[None, :]).astype(np.float32)
@@ -312,6 +313,7 @@ def processClass(
     min_area=None,
     dbscan_prams={},
     use_myscan=False,
+    MAX_NUM=50000,
 ):
     df["class_value"] = df[classname]  # * 2 - df["max"]
     subdf = df[df["class_value"] > min_prob]
@@ -346,6 +348,8 @@ def processClass(
         subdf = subdf[subdf["area"] < max_area]
     if min_area is not None:
         subdf = subdf[subdf["area"] > min_area]
+    if len(subdf) > MAX_NUM:
+        raise ValueError(f"Too many instances after filtering: received {len(subdf)} instances, raise thresholds for screening")
     labels = getLabels(subdf, use_myscan=use_myscan, **dbscan_prams)
     print("number of instances in class ", len(np.unique(labels)))
     subdf["label"] = list(labels)
@@ -794,6 +798,9 @@ def getPredictionCenters(df, classname, top_n=None, image_size=1024, thres=None)
     ids = np.array(ids)
     score = np.array(score)
     predict_center = np.array(predict_center)
+    if predict_center.size == 0:
+        predict_center = np.empty((0, 3), dtype=float)
+        return score, predict_center, ids
     predict_center *= np.array([1, image_size, image_size])
     return score, predict_center, ids
 
@@ -812,6 +819,22 @@ def match_and_find_closest(pred_centers, label_centers):
         match_distances: np.ndarray of distances for the matched pairs
         closest_preds: np.ndarray of shape (N_label, 2), where each row = (closest_pred_index, distance)
     """
+    pred_centers = np.asarray(pred_centers)
+    label_centers = np.asarray(label_centers)
+
+    if label_centers.size == 0:
+        return [], np.array([], dtype=float), np.empty((0, 2), dtype=float)
+
+    if pred_centers.size == 0:
+        closest_preds = np.stack(
+            [
+                np.full(len(label_centers), -1, dtype=int),
+                np.full(len(label_centers), np.inf, dtype=float),
+            ],
+            axis=1,
+        )
+        return [], np.array([], dtype=float), closest_preds
+
     # Compute distance matrix between labels and predictions
     dist_matrix = cdist(label_centers, pred_centers, metric="euclidean")
 
@@ -874,19 +897,35 @@ def calculate_metrics(match_pairs, match_distances, y_pred_prob, threshold=20):
         precision: float — Precision score
         recall: float — Recall score
     """
-    matches = np.array(match_pairs)
+    y_pred_prob = np.asarray(y_pred_prob)
+    if y_pred_prob.size == 0:
+        return {
+            "auroc": float("nan"),
+            "aupr": 0.0,
+            "aupr2": 0.0,
+            "cnts": 0,
+        }
+
+    matches = np.array(match_pairs, dtype=int)
     find_matches = np.array(match_distances) < threshold
-    matched = matches[find_matches]
-    score_label = np.zeros(len(y_pred_prob))
-    score_label[matched[:, 1]] = 1
+    score_label = np.zeros(len(y_pred_prob), dtype=int)
+    if matches.size > 0:
+        matched = matches[find_matches]
+        if matched.size > 0:
+            score_label[matched[:, 1]] = 1
 
     precision, recall, _ = precision_recall_curve(score_label.astype(int), y_pred_prob)
     aupr = auc(recall, precision)
 
     aupr2 = average_precision_score(score_label.astype(int), y_pred_prob)
 
+    try:
+        auroc = roc_auc_score(score_label.astype(int), y_pred_prob)
+    except ValueError:
+        auroc = float("nan")
+
     return {
-        "auroc": roc_auc_score(score_label.astype(int), y_pred_prob),
+        "auroc": auroc,
         "aupr": aupr,
         "aupr2": aupr2,
         "cnts": sum(find_matches),

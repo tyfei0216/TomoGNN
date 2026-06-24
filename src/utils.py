@@ -728,6 +728,58 @@ def get_iou(X):
     iou = iou.numpy()
     return iou
 
+def get_iou_numpy(X):
+    """
+    Pure numpy version of get_iou.
+    
+    Args:
+        X: numpy array of shape (N, 4) with boxes in center format (x, y, w, h)
+    
+    Returns:
+        iou: numpy array of shape (N, N) with pairwise IoU values
+    """
+    # Convert from center format (x, y, w, h) to corner format (x1, y1, x2, y2)
+    x, y, w, h = X[:, 0], X[:, 1], X[:, 2], X[:, 3]
+    x1 = x - w / 2
+    y1 = y - h / 2
+    x2 = x + w / 2
+    y2 = y + h / 2
+    
+    # Stack into corner format boxes: (x1, y1, x2, y2)
+    boxes = np.stack([x1, y1, x2, y2], axis=1)  # shape: (N, 4)
+    
+    # Compute pairwise IoU
+    N = boxes.shape[0]
+    iou = np.zeros((N, N), dtype=np.float32)
+    
+    # Get areas for each box
+    areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])  # shape: (N,)
+    
+    # Compute pairwise intersections and unions
+    # Expand dims for broadcasting: (N, 1, 4) and (1, N, 4)
+    boxes_i = boxes[:, np.newaxis, :]  # shape: (N, 1, 4)
+    boxes_j = boxes[np.newaxis, :, :]  # shape: (1, N, 4)
+    
+    # Compute intersection coordinates
+    x1_inter = np.maximum(boxes_i[:, :, 0], boxes_j[:, :, 0])  # shape: (N, N)
+    y1_inter = np.maximum(boxes_i[:, :, 1], boxes_j[:, :, 1])
+    x2_inter = np.minimum(boxes_i[:, :, 2], boxes_j[:, :, 2])
+    y2_inter = np.minimum(boxes_i[:, :, 3], boxes_j[:, :, 3])
+    
+    # Compute intersection area
+    w_inter = np.maximum(0, x2_inter - x1_inter)
+    h_inter = np.maximum(0, y2_inter - y1_inter)
+    inter_area = w_inter * h_inter  # shape: (N, N)
+    
+    # Compute union area
+    areas_i = areas[:, np.newaxis]  # shape: (N, 1)
+    areas_j = areas[np.newaxis, :]  # shape: (1, N)
+    union_area = areas_i + areas_j - inter_area  # shape: (N, N)
+    
+    # Compute IoU
+    iou = inter_area / (union_area + 1e-6)  # add small epsilon to avoid division by zero
+    
+    return iou
 
 # def get_neighbors(
 #     X, z_thres1=0.03, z_thres2=0.5, iou_thres=0.4, num_classes=5, obj_thres=0.2
