@@ -8,6 +8,8 @@ import torch
 import torchvision
 from scipy.ndimage import center_of_mass, gaussian_filter, gaussian_filter1d
 from scipy.optimize import linear_sum_assignment
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
 from scipy.spatial.distance import cdist
 from sklearn.cluster import DBSCAN
 from sklearn.metrics import (
@@ -18,9 +20,10 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
+from sklearn.neighbors import sort_graph_by_row_values
+from tqdm import tqdm
 
 import utils
-from tqdm import tqdm 
 
 
 def generatedf(
@@ -31,15 +34,19 @@ def generatedf(
     has_none=False,
     empty=4,
     num_classes=4,
-    z_multiply=500,
+    z_multiply=None,
     filter_prob=0.05,
-    return_mask=False,
+    # return_mask=False,
     return_embeds=False,
-    max_edges=25,
+    max_edges=50,
+    nms=0.4,
+    iou_thres=0.4,
 ):
     # silence dubugging outputs
     # saved_stdout = sys.stdout
     # sys.stdout = io.StringIO()
+    if z_multiply is None:
+        z_multiply = dataset.zpos_max
     t = [
         "z",
         "x",
@@ -50,8 +57,8 @@ def generatedf(
     t.extend(columns)
     with torch.no_grad():
         alldfs = []
-        graphs = []
-        all_masks = []
+        features = []
+        # all_masks = []
         embeds = []
         for i in range(gap):
             model.stage = "stage 1"
@@ -64,22 +71,28 @@ def generatedf(
                 offset=i,
                 has_none=has_none,
                 empty=empty,
+                nms=nms,
             )
-            if return_mask:
-                all_masks.append(retdict["masks"])
+            # if return_mask:
+            #     all_masks.append(retdict["masks"])
             graph = utils.convertStage2Dataset(
-                retdict, num_classes=num_classes, obj_thres=0.1, max_edges=max_edges
+                retdict,
+                num_classes=num_classes,
+                obj_thres=0.1,
+                max_edges=max_edges,
+                iou_thres=iou_thres,
             )
-            print("build graph")
-            graphs.append(graph)
+            # print("build graph")
+            features.append(graph.x.cpu().numpy())
             model.stage = "stage 2"
+            graph = graph.to(model.device)
             res = model(graph.x, graph.edge_index)
             embeds.append(res["embeddings"].cpu().numpy())
-            z = graph.x[:, [0]] * z_multiply
+            z = graph.x[:, [0]].cpu() * z_multiply
             # z = z.long()
-            prob = torch.softmax(res["predict"], 1)
-            pred_boxes = res["box"]
-            print("prepare df")
+            prob = torch.softmax(res["predict"], 1).cpu()
+            pred_boxes = res["box"].cpu()
+            # print("prepare df")
             df = torch.cat([z, pred_boxes, prob], 1)
             df = df.numpy()
             df = pd.DataFrame(df, columns=t)
@@ -88,17 +101,18 @@ def generatedf(
             subdf = df[columns]
             df["max"] = subdf.max(axis=1)
             df["largest"] = subdf.idxmax(axis=1)
+            # print(df.shape, graph.x.shape)
             alldfs.append(df)
     # sys.stdout = saved_stdout
     embeds = np.concatenate(embeds, 0)
     alldfs = pd.concat(alldfs, ignore_index=True)
     if return_embeds:
-        return alldfs, graphs, embeds
-    if return_mask:
-        print(all_masks)
-        all_masks = torch.cat(all_masks, 0)
-        return alldfs, graphs, all_masks.detach().cpu().numpy()
-    return alldfs, graphs
+        return alldfs, features
+    # if return_mask:
+    #     print(all_masks)
+    #     all_masks = torch.cat(all_masks, 0)
+    #     return alldfs, graphs, all_masks.detach().cpu().numpy()
+    return alldfs
 
 
 def generatedfBySlice(
@@ -111,8 +125,11 @@ def generatedfBySlice(
     num_classes=4,
     z_multiply=500,
     length=15,
+    nms=0.4,
+    iou_thres=0.4,
     return_mask=False,
     return_embeds=False,
+    return_retdict=False,
 ):
     t = [
         "z",
@@ -127,20 +144,22 @@ def generatedfBySlice(
         # graphs = []
         all_masks = []
         embeds = []
+        try:
+            model_device = next(model.parameters()).device
+        except StopIteration:
+            model_device = torch.device("cpu")
+        use_gpu = model_device.type != "cpu"
+
         model.stage = "stage 1"
         retdict = utils.runStage1(
-            model,
-            dataset,
-            (800, 800),
-            has_none=has_none,
-            empty=empty,
+            model, dataset, (800, 800), has_none=has_none, empty=empty, nms=nms
         )
         print("finish stage1")
 
         slice_ids = sorted(retdict.keys())
         model.stage = "stage 2"
 
-        for slice_id in slice_ids:
+        for slice_id in tqdm(slice_ids, desc="Stage 2 slices"):
             needIDs, pos = utils.pickout(retdict, slice_id, gap, length)
             center_id = needIDs[pos]
 
@@ -164,27 +183,35 @@ def generatedfBySlice(
 
             if len(merged["feature"]) == 0:
                 continue
-            
+
             merged["feature"] = torch.cat(merged["feature"], dim=0)
             merged["label"] = torch.cat(merged["label"], dim=0)
             merged["box_mask"] = torch.cat(merged["box_mask"], dim=0)
             merged["boxes"] = torch.cat(merged["boxes"], dim=0)
 
             graph = utils.convertStage2Dataset(
-                merged,
-                num_classes=num_classes,
-                obj_thres=0.1,
+                merged, num_classes=num_classes, obj_thres=0.1, iou_thres=iou_thres
             )
             # graphs.append(graph)
 
-            res = model(graph.x, graph.edge_index)
-            slice_mask = torch.round(graph.x[:, 0] * z_multiply).long() == int(center_id)
+            # Keep retdict/merged tensors on CPU. Move only stage-2 graph tensors when needed.
+            if use_gpu:
+                graph_x = graph.x.to(model_device, non_blocking=True)
+                graph_edge_index = graph.edge_index.to(model_device, non_blocking=True)
+            else:
+                graph_x = graph.x
+                graph_edge_index = graph.edge_index
+
+            res = model(graph_x, graph_edge_index)
+            slice_mask = torch.round(graph_x[:, 0] * z_multiply).long() == int(
+                center_id
+            )
             if not torch.any(slice_mask):
                 continue
 
             prob = torch.softmax(res["predict"], 1)[slice_mask]
             pred_boxes = res["box"][slice_mask]
-            z = graph.x[slice_mask][:, [0]] * z_multiply
+            z = graph_x[slice_mask][:, [0]] * z_multiply
 
             df = torch.cat([z, pred_boxes, prob], 1)
             df = pd.DataFrame(df.detach().cpu().numpy(), columns=t)
@@ -200,16 +227,26 @@ def generatedfBySlice(
             if return_mask and len(merged["masks"]) > 0:
                 all_masks.append(torch.cat(merged["masks"], dim=0).detach().cpu())
 
-        alldfs = pd.concat(alldfs, ignore_index=True) if len(alldfs) > 0 else pd.DataFrame(columns=t + ["max", "largest"])
+        alldfs = (
+            pd.concat(alldfs, ignore_index=True)
+            if len(alldfs) > 0
+            else pd.DataFrame(columns=t + ["max", "largest"])
+        )
+
+        if return_retdict:
+            return alldfs, retdict
 
         if return_embeds:
             embeds = np.concatenate(embeds, 0) if len(embeds) > 0 else np.empty((0,))
             return alldfs, embeds
         if return_mask:
-            all_masks = torch.cat(all_masks, 0) if len(all_masks) > 0 else torch.empty(0)
+            all_masks = (
+                torch.cat(all_masks, 0) if len(all_masks) > 0 else torch.empty(0)
+            )
             return alldfs, all_masks.detach().cpu().numpy()
 
         return alldfs
+
 
 def myscan(iou_matrix, zpos, eps=0.6, max_z_diff=2):
     num = iou_matrix.shape[0]
@@ -267,41 +304,257 @@ def getLabels(
     if min_samples is None:
         min_samples = cutoff + 1
 
-    hdb = DBSCAN(min_samples=min_samples, eps=eps, metric="precomputed")
-    # subdf = subdf.sort_values(by="z")
-    # zpos = subdf["z"].values
-
     x = subdf[["x", "y", "w", "h"]].values
     if enlarge > 0.0:
         x[:, 2:] += enlarge
-    iou = utils.get_iou_numpy(x)
-    print("get iou")
-    iou = 1 - iou
-    mask = subdf["z"].values
-    dis_penalty = np.abs(mask[:, None] - mask[None, :]).astype(np.float32)
-    # print(dis_penalty)
-    # print(iou)
-    mask = mask[:, None] == mask[None, :]
-    iou[mask] = 2.0
-    # mask = subdf["z"].values
-    if cutoff is not None:
-        dis_penalty[dis_penalty <= cutoff] = 0.0
-        dis_penalty[dis_penalty > cutoff] = 2.0
-    else:
-        dis_penalty[dis_penalty > dis_penalty_cutoff] = 2.0 / dis_penalty_coef
-        # print(dis_penalty, dis_penalty_coef)
-        dis_penalty *= dis_penalty_coef
+    z_values = subdf["z"].to_numpy(dtype=np.int32, copy=False)
+    iou = utils.get_iou_numpy(x).tocoo()
+    upper = iou.row < iou.col
+    rows = iou.row[upper]
+    cols = iou.col[upper]
+    iou_values = iou.data[upper].astype(np.float32, copy=False)
 
-    iou = iou + dis_penalty
+    z_diff = np.abs(z_values[rows] - z_values[cols]).astype(np.float32)
+    z_limit = cutoff if cutoff is not None else dis_penalty_cutoff
+    keep = z_diff <= z_limit
+
+    if cutoff is None:
+        distances = (1.0 - iou_values) + z_diff * dis_penalty_coef
+    else:
+        distances = 1.0 - iou_values
+
+    tiny = np.finfo(np.float32).tiny
+    distances = np.maximum(distances, tiny)
+    keep &= distances <= eps
+
+    rows = rows[keep]
+    cols = cols[keep]
+    distances = distances[keep]
+
+    diag = np.arange(len(subdf), dtype=np.int64)
+    diag_dist = np.full(len(subdf), tiny, dtype=np.float32)
+    sym_rows = np.concatenate([rows, cols, diag])
+    sym_cols = np.concatenate([cols, rows, diag])
+    sym_distances = np.concatenate([distances, distances, diag_dist])
+
+    distance_graph = csr_matrix(
+        (sym_distances, (sym_rows, sym_cols)), shape=(len(subdf), len(subdf))
+    )
+    distance_graph = sort_graph_by_row_values(
+        distance_graph, warn_when_not_sorted=False
+    )
+    hdb = DBSCAN(min_samples=min_samples, eps=eps, metric="precomputed")
     if use_myscan:
-        return myscan(iou, subdf["z"].values, eps=eps, max_z_diff=dis_penalty_cutoff)
-    hdb.fit(iou)
-    # print(iou)
+        dense = distance_graph.toarray()
+        return myscan(dense, z_values, eps=eps, max_z_diff=dis_penalty_cutoff)
+    hdb.fit(distance_graph)
     return hdb.labels_
     # subdf["label"] = hdb.labels_
 
 
 # np.unique(hdb.labels_).tolist()
+
+
+def _pairwise_iou_xywh(boxes_a, boxes_b):
+    if len(boxes_a) == 0 or len(boxes_b) == 0:
+        return np.zeros((len(boxes_a), len(boxes_b)), dtype=np.float32)
+
+    ax1 = boxes_a[:, 0] - boxes_a[:, 2] / 2.0
+    ay1 = boxes_a[:, 1] - boxes_a[:, 3] / 2.0
+    ax2 = boxes_a[:, 0] + boxes_a[:, 2] / 2.0
+    ay2 = boxes_a[:, 1] + boxes_a[:, 3] / 2.0
+
+    bx1 = boxes_b[:, 0] - boxes_b[:, 2] / 2.0
+    by1 = boxes_b[:, 1] - boxes_b[:, 3] / 2.0
+    bx2 = boxes_b[:, 0] + boxes_b[:, 2] / 2.0
+    by2 = boxes_b[:, 1] + boxes_b[:, 3] / 2.0
+
+    inter_x1 = np.maximum(ax1[:, None], bx1[None, :])
+    inter_y1 = np.maximum(ay1[:, None], by1[None, :])
+    inter_x2 = np.minimum(ax2[:, None], bx2[None, :])
+    inter_y2 = np.minimum(ay2[:, None], by2[None, :])
+
+    inter_w = np.maximum(0.0, inter_x2 - inter_x1)
+    inter_h = np.maximum(0.0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+
+    area_a = np.maximum(0.0, (ax2 - ax1) * (ay2 - ay1))
+    area_b = np.maximum(0.0, (bx2 - bx1) * (by2 - by1))
+    union = area_a[:, None] + area_b[None, :] - inter_area
+    union = np.maximum(union, 1e-8)
+    return inter_area / union
+
+
+def _build_sparse_edges_by_z(boxes, z, cutoff=5, iou_thres=0.3):
+    if len(boxes) == 0:
+        return np.empty((0, 2), dtype=np.int64)
+
+    cutoff = int(cutoff)
+    if cutoff < 1:
+        return np.empty((0, 2), dtype=np.int64)
+
+    z = z.astype(int)
+    z_to_ids = {}
+    for idx, zi in enumerate(z):
+        z_to_ids.setdefault(int(zi), []).append(idx)
+
+    edge_rows = []
+    edge_cols = []
+    all_z = sorted(z_to_ids.keys())
+    all_z_set = set(all_z)
+    for zi in all_z:
+        ids_i = np.asarray(z_to_ids[zi], dtype=np.int64)
+        box_i = boxes[ids_i]
+        for dz in range(1, cutoff + 1):
+            zj = zi + dz
+            if zj not in all_z_set:
+                continue
+            ids_j = np.asarray(z_to_ids[zj], dtype=np.int64)
+            box_j = boxes[ids_j]
+            iou_ij = _pairwise_iou_xywh(box_i, box_j)
+            take_i, take_j = np.where(iou_ij >= iou_thres)
+            if len(take_i) == 0:
+                continue
+            edge_rows.append(ids_i[take_i])
+            edge_cols.append(ids_j[take_j])
+
+    if len(edge_rows) == 0:
+        return np.empty((0, 2), dtype=np.int64)
+
+    rows = np.concatenate(edge_rows)
+    cols = np.concatenate(edge_cols)
+    edges = np.stack([rows, cols], axis=1)
+    return edges.astype(np.int64)
+
+
+def getLabelsByGraph(
+    subdf, method, enlarge=0.0, cutoff=5, iou_thres=0.3, leiden_resolution=1.0
+):
+    x = subdf[["x", "y", "w", "h"]].to_numpy(dtype=np.float32, copy=True)
+    z = subdf["z"].to_numpy(dtype=np.int32)
+    if enlarge > 0.0:
+        x[:, 2:] += enlarge
+
+    method = str(method).lower()
+    edges = _build_sparse_edges_by_z(x, z, cutoff=cutoff, iou_thres=iou_thres)
+    n = len(subdf)
+
+    if method in ["connected_components", "connected", "cc"]:
+        if len(edges) == 0:
+            return np.arange(n, dtype=np.int32)
+        rows = np.concatenate([edges[:, 0], edges[:, 1]])
+        cols = np.concatenate([edges[:, 1], edges[:, 0]])
+        data = np.ones(len(rows), dtype=np.int8)
+        graph = csr_matrix((data, (rows, cols)), shape=(n, n))
+        _, labels = connected_components(csgraph=graph, directed=False)
+        return labels.astype(np.int32)
+
+    if method == "leiden":
+        if len(edges) == 0:
+            return np.arange(n, dtype=np.int32)
+        try:
+            import igraph as ig
+            import leidenalg as la
+        except ImportError as e:
+            raise ImportError(
+                "Leiden clustering requires `python-igraph` and `leidenalg`. "
+                "Install them before using method='leiden'."
+            ) from e
+
+        g = ig.Graph(n=n, edges=[tuple(x) for x in edges.tolist()], directed=False)
+        partition = la.find_partition(
+            g,
+            la.RBConfigurationVertexPartition,
+            seed=0,
+            resolution_parameter=leiden_resolution,
+        )
+        labels = np.empty(n, dtype=np.int32)
+        for community_id, members in enumerate(partition):
+            labels[np.asarray(members, dtype=np.int64)] = community_id
+        return labels
+
+    if method == "graph":
+        if len(edges) == 0:
+            return csr_matrix((n, n), dtype=np.int8)
+        rows = np.concatenate([edges[:, 0], edges[:, 1]])
+        cols = np.concatenate([edges[:, 1], edges[:, 0]])
+        data = np.ones(len(rows), dtype=np.int8)
+        return csr_matrix((data, (rows, cols)), shape=(n, n))
+
+    raise ValueError(
+        "Unsupported graph method. Use one of: "
+        "'connected_components'/'cc', 'leiden', or 'graph'."
+    )
+
+
+def getLabelByDirectScan(subdf, iou_thres=0.3, enlarge=0.02, max_count=30):
+    if len(subdf) == 0:
+        return np.empty((0,), dtype=np.int32)
+
+    # Preserve original index order in the returned labels.
+    ordered = subdf.sort_values(by="z")
+    idx = ordered.index.to_numpy()
+    x = ordered[["x", "y", "w", "h"]].to_numpy(dtype=np.float32, copy=True)
+    z = ordered["z"].to_numpy(dtype=np.int32)
+    if enlarge > 0.0:
+        x[:, 2:] += float(enlarge)
+
+    labels_sorted = np.empty(len(ordered), dtype=np.int32)
+    label_sizes = {}
+    next_label = 0
+
+    pos_by_z = {}
+    for pos, zi in enumerate(z):
+        pos_by_z.setdefault(int(zi), []).append(pos)
+
+    all_z = sorted(pos_by_z.keys())
+    prev_z = None
+    prev_pos = np.empty((0,), dtype=np.int64)
+
+    for zi in all_z:
+        curr_pos = np.asarray(pos_by_z[zi], dtype=np.int64)
+        curr_boxes = x[curr_pos]
+
+        if prev_z is None or zi != prev_z + 1 or len(prev_pos) == 0:
+            for p in curr_pos:
+                labels_sorted[p] = next_label
+                label_sizes[next_label] = 1
+                next_label += 1
+        else:
+            prev_boxes = x[prev_pos]
+            iou_mat = _pairwise_iou_xywh(curr_boxes, prev_boxes)
+
+            for local_i, p in enumerate(curr_pos):
+                if iou_mat.shape[1] == 0:
+                    best_iou = -1.0
+                    best_prev_label = None
+                else:
+                    best_j = int(np.argmax(iou_mat[local_i]))
+                    best_iou = float(iou_mat[local_i, best_j])
+                    best_prev_label = int(labels_sorted[prev_pos[best_j]])
+
+                use_prev = (
+                    best_prev_label is not None
+                    and best_iou >= float(iou_thres)
+                    and label_sizes.get(best_prev_label, 0) < int(max_count)
+                )
+
+                if use_prev:
+                    labels_sorted[p] = best_prev_label
+                    label_sizes[best_prev_label] += 1
+                else:
+                    labels_sorted[p] = next_label
+                    label_sizes[next_label] = 1
+                    next_label += 1
+
+        prev_z = zi
+        prev_pos = curr_pos
+
+    out = np.empty(len(subdf), dtype=np.int32)
+    out_index = {k: i for i, k in enumerate(subdf.index.to_numpy())}
+    for p, src_idx in enumerate(idx):
+        out[out_index[src_idx]] = labels_sorted[p]
+    return out
 
 
 def processClass(
@@ -311,8 +564,9 @@ def processClass(
     nms,
     max_area=None,
     min_area=None,
-    dbscan_prams={},
+    cluster_params={},
     use_myscan=False,
+    method="DBSCAN",
     MAX_NUM=50000,
 ):
     df["class_value"] = df[classname]  # * 2 - df["max"]
@@ -328,7 +582,7 @@ def processClass(
         #     torch.tensor(r["class_value"].values),
         #     np.array(["same" for i in range(len(r))]),
         # )
-        keep  = torchvision.ops.nms(
+        keep = torchvision.ops.nms(
             utils.convertBoxes(torch.tensor(r[["x", "y", "w", "h"]].values)),
             torch.tensor(r["class_value"].values),
             nms,
@@ -348,9 +602,28 @@ def processClass(
         subdf = subdf[subdf["area"] < max_area]
     if min_area is not None:
         subdf = subdf[subdf["area"] > min_area]
-    if len(subdf) > MAX_NUM:
-        raise ValueError(f"Too many instances after filtering: received {len(subdf)} instances, raise thresholds for screening")
-    labels = getLabels(subdf, use_myscan=use_myscan, **dbscan_prams)
+
+    if method == "DBSCAN":
+        if len(subdf) > MAX_NUM:
+            raise ValueError(
+                f"Too many instances after filtering: received {len(subdf)} instances, raise thresholds for screening"
+            )
+        labels = getLabels(subdf, use_myscan=False, **cluster_params)
+    elif method == "myscan":
+        if len(subdf) > MAX_NUM:
+            raise ValueError(
+                f"Too many instances after filtering: received {len(subdf)} instances, raise thresholds for screening"
+            )
+        labels = getLabels(subdf, use_myscan=True, **cluster_params)
+    elif method.lower() in ["connected_components", "connected", "cc", "leiden"]:
+        labels = getLabelsByGraph(subdf, method=method, **cluster_params)
+    elif method.lower() in ["direct_scan", "directscan", "scan"]:
+        labels = getLabelByDirectScan(subdf, **cluster_params)
+    else:
+        raise ValueError(
+            "Unsupported method. Use one of: 'DBSCAN', 'myscan', "
+            "'connected_components'/'cc', 'leiden', or 'direct_scan'."
+        )
     print("number of instances in class ", len(np.unique(labels)))
     subdf["label"] = list(labels)
     return subdf
@@ -387,11 +660,11 @@ def markFilter(
     targetdf,
     max_cnt=100,
     remove_iou=0.5,
-    min_samples=10,
+    min_samples=12,
     max_samples=500,
-    min_length=16,
+    min_length=12,
     extend=0,
-    threshold=0.2,
+    threshold=0.15,
 ):
     if targetdf is None:
         print("targetdf is None, skip")
@@ -483,7 +756,7 @@ def refineMembMask(
     kernal_size=3,
     morph_open_iterations=2,
     morph_close_iterations=1,
-    **kwargs
+    **kwargs,
 ):
     if sigma > 0:
         mask = gaussian_filter(mask, sigma=sigma)
@@ -527,7 +800,7 @@ def refineMask(
     max_contours=1,
     apply_contours=True,
     apply_convex_hull=False,
-    **kwargs
+    **kwargs,
 ):
     # Step 1: Convert to binary
     binary_mask = (mask > threshold).astype(np.uint8) * 255

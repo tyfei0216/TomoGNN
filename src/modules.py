@@ -346,7 +346,7 @@ class DetrModel(L.LightningModule):
         lr_detr=None,
         lr_backbone=None,
         gnn_in_channel=10,
-        layer_type="GCNConv",
+        layer_type="TransformerConv",
         dropout=True,
         scheduler_step=-1,
         warmup_epoches=1,
@@ -357,7 +357,10 @@ class DetrModel(L.LightningModule):
         class_weights=None,
         consistency_regularization_coef=0.5,
         box_head="lora",
-        nms = -1.0
+        nms=-1.0,
+        iou_thres=0.4,
+        graph_thres=-1.0,
+        zpos_max=500,
     ):
         super().__init__()
         if isinstance(model, dict):
@@ -390,6 +393,8 @@ class DetrModel(L.LightningModule):
         self.feature_dim = feature_dim
         self.box_head = box_head
         self.nms = nms
+        self.iou_thres = iou_thres
+        self.graph_thres = graph_thres
 
         self.acc = torchmetrics.Accuracy(
             task="multiclass", num_classes=output_dim, average="macro"
@@ -406,6 +411,7 @@ class DetrModel(L.LightningModule):
             layer_type=layer_type,
             dropout=dropout,
             box_head=box_head,
+            zpos=zpos_max,
         )
         # self.class_weights = class_weights
         if class_weights is not None:
@@ -575,20 +581,79 @@ class DetrModel(L.LightningModule):
         edge_mask=None,
         edge_type=None,
         return_outputs=False,
+        iou_thres=0.4,
+        label=None,
+        positions=None,
+        thres=-1.0,
     ):
 
         x = x.to(self.device)
         edge = edge.to(self.device)
         mask = mask.to(self.device)
         y = y.to(self.device)
+        self.iou_thres = iou_thres
 
         ret_dict = self(x=x, edge_index=edge)
+        y_for_loss = y
+
+        if label is not None and positions is not None:
+            if isinstance(positions, torch.Tensor):
+                positions = positions.tolist()
+            if len(positions) >= 2:
+                matched_targets = []
+                total_nodes = ret_dict["predict"].shape[0]
+                num_slices = min(len(label), len(positions) - 1)
+                empty_label = self.output_dim - 1
+                for i in range(num_slices):
+                    start = int(positions[i])
+                    end = int(positions[i + 1])
+                    start = max(0, min(start, total_nodes))
+                    end = max(0, min(end, total_nodes))
+                    if end < start:
+                        start, end = end, start
+
+                    target_i = torch.full(
+                        (end - start,),
+                        empty_label,
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+
+                    label_i = label[i]
+                    has_gt = (
+                        "class_labels" in label_i
+                        and label_i["class_labels"] is not None
+                        and len(label_i["class_labels"]) > 0
+                        and "boxes" in label_i
+                        and label_i["boxes"] is not None
+                    )
+                    if has_gt and end > start:
+                        gt = {
+                            "class_labels": label_i["class_labels"].to(self.device),
+                            "boxes": label_i["boxes"].to(self.device),
+                        }
+                        match_res = utils.matcher(
+                            {
+                                "pred_boxes": ret_dict["box"][start:end].unsqueeze(0),
+                                "logits": ret_dict["predict"][start:end].unsqueeze(0),
+                            },
+                            [gt],
+                        )[0]
+                        if len(match_res[0]) > 0:
+                            target_i[match_res[0]] = gt["class_labels"][match_res[1]]
+
+                    matched_targets.append(target_i)
+
+                if len(matched_targets) > 0:
+                    constructed_y = torch.cat(matched_targets, dim=0)
+                    if constructed_y.shape[0] == y.shape[0]:
+                        y_for_loss = constructed_y
         # print(ret_dict["predict"][mask].shape, y[mask].shape)
         # print(torch.max(y[mask]))
         # print(ret_dict["predict"].shape)
         # print(y)
         # print(ret_dict["predict"][mask].shape)
-        loss = self.cri(ret_dict["predict"][mask], y[mask])
+        loss = self.cri(ret_dict["predict"][mask], y_for_loss[mask])
         if edge_type is not None and sum(edge_type) > 0:
             # print(edge_type)
             # print(edge_type)
@@ -609,7 +674,9 @@ class DetrModel(L.LightningModule):
         # print("before auroc")
         loss_dict = {
             "loss": loss.detach().cpu(),
-            "auroc": self.auroc(ret_dict["predict"][mask].detach(), y[mask]).cpu(),
+            "auroc": self.auroc(
+                ret_dict["predict"][mask].detach(), y_for_loss[mask]
+            ).cpu(),
         }
         # print("after auroc")
         self.auroc.reset()
@@ -768,7 +835,9 @@ class DetrModel(L.LightningModule):
                     empty=self.output_dim - 1,
                 )
                 data2 = utils.convertStage2Dataset(
-                    retdict, num_classes=self.output_dim - 1, obj_thres=0.2
+                    retdict,
+                    num_classes=self.output_dim - 1,
+                    obj_thres=0.1,
                 )
                 self.stage = "stage 2"
                 x = data2.x
@@ -899,11 +968,19 @@ class DetrModel(L.LightningModule):
                 t = torch.no_grad
             with t():
                 loss, loss_dict, output = self.common_step_stage1(batch[0], True)
+                # has_none is only true for detr. Not conditional or deformable detr.
                 retdict = utils.process(
-                    output, batch[0]["labels"], empty=self.output_dim - 1, nms=self.nms
+                    output,
+                    batch[0]["labels"],
+                    empty=self.output_dim - 1,
+                    nms=self.nms,
+                    thres=self.graph_thres,  # has_none=True
                 )
                 data2 = utils.convertStage2Dataset(
-                    retdict, obj_thres=0.15, num_classes=self.output_dim - 1
+                    retdict,
+                    obj_thres=0.15,
+                    num_classes=self.output_dim - 1,
+                    iou_thres=self.iou_thres,
                 )
             self.stage = "stage 2"
             x = data2.x
@@ -924,6 +1001,8 @@ class DetrModel(L.LightningModule):
                 edge_label,
                 edge_type=edge_type,
                 return_outputs=False,
+                # label=batch[0]["labels"],
+                # positions = retdict["positions"]
             )
             self.stage = "stage 1 + 2"
             loss = loss + loss2
@@ -1286,6 +1365,7 @@ class GCN(torch.nn.Module):
         else:
             raise ValueError("Invalid layer type")
 
+        self.zpos = zpos
         pe = self.inipos(input_dim)
         pe.requires_grad = False
         self.register_buffer("pe", pe)
@@ -1331,7 +1411,6 @@ class GCN(torch.nn.Module):
             nn.Sigmoid(),
         )
 
-        self.zpos = zpos
         if record:
             self.record = []
         else:
@@ -1341,7 +1420,7 @@ class GCN(torch.nn.Module):
         inv_freq = 1.0 / (
             (100 * 10) ** (torch.arange(0, channels, 2).float() / channels)
         )  # .to(self.device)
-        t = torch.arange(0, 505)[:, None]  # .to(self.device)
+        t = torch.arange(0, self.zpos + 5)[:, None]  # .to(self.device)
         # print(t.shape, inv_freq.shape)
         pos_enc_a = torch.sin(t.repeat(1, channels // 2) * inv_freq)
         pos_enc_b = torch.cos(t.repeat(1, channels // 2) * inv_freq)
@@ -1577,13 +1656,192 @@ class VitForMask(nn.Module):
         return output
 
 
+class Residual3DBlock(nn.Module):
+    """Two-layer 3D residual block used by Particle3DNet."""
+
+    def __init__(self, in_channels, out_channels, dropout=0.0):
+        super().__init__()
+        self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm3d(out_channels)
+        self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm3d(out_channels)
+        self.act = nn.SiLU()
+        self.drop = nn.Dropout3d(dropout) if dropout > 0 else nn.Identity()
+
+        if in_channels != out_channels:
+            self.skip = nn.Conv3d(in_channels, out_channels, kernel_size=1)
+        else:
+            self.skip = nn.Identity()
+
+    def forward(self, x):
+        identity = self.skip(x)
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.act(out)
+        out = self.drop(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = out + identity
+        out = self.act(out)
+        return out
+
+
+class CenterHead3D(nn.Module):
+    """Predict center heatmap logits on pooled 3D feature volumes."""
+
+    def __init__(
+        self,
+        in_channels,
+        bottleneck_channels=32,
+        nhead=4,
+        num_layers=3,
+        aux_num_classes=None,
+        enable_aux_head=False,
+    ):
+        super().__init__()
+        self.bottleneck = nn.Sequential(
+            nn.Conv3d(in_channels, bottleneck_channels, kernel_size=1),
+            nn.BatchNorm3d(bottleneck_channels),
+            nn.SiLU(),
+        )
+        self.pos_mlp = nn.Sequential(
+            nn.Linear(3, bottleneck_channels),
+            nn.SiLU(),
+            nn.Linear(bottleneck_channels, bottleneck_channels),
+        )
+        layer = nn.TransformerEncoderLayer(
+            d_model=bottleneck_channels,
+            nhead=nhead,
+            dim_feedforward=bottleneck_channels * 4,
+            dropout=0.1,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
+        self.out = nn.Linear(bottleneck_channels, 1)
+        self.enable_aux_head = enable_aux_head and (aux_num_classes is not None)
+        self.aux_num_classes = aux_num_classes
+        if self.enable_aux_head:
+            self.aux_head = nn.Sequential(
+                nn.LayerNorm(bottleneck_channels),
+                nn.Linear(bottleneck_channels, bottleneck_channels),
+                nn.GELU(),
+                nn.Linear(bottleneck_channels, aux_num_classes),
+            )
+
+    def forward(self, x):
+        # x: (B, C, D, H, W)
+        x = self.bottleneck(x)
+        b, c, d, h, w = x.shape
+        tokens = x.flatten(2).transpose(1, 2)  # (B, D*H*W, C)
+
+        gz = torch.linspace(0.0, 1.0, d, device=x.device, dtype=x.dtype)
+        gy = torch.linspace(0.0, 1.0, h, device=x.device, dtype=x.dtype)
+        gx = torch.linspace(0.0, 1.0, w, device=x.device, dtype=x.dtype)
+        zz, yy, xx = torch.meshgrid(gz, gy, gx, indexing="ij")
+        pos = torch.stack((zz, yy, xx), dim=-1).reshape(1, d * h * w, 3)
+        pos = self.pos_mlp(pos)
+
+        tokens = self.encoder(tokens + pos)
+        logits = self.out(tokens).transpose(1, 2).reshape(b, 1, d, h, w)
+        ret = {"center_logits": logits}
+
+        if self.enable_aux_head:
+            flat_center_logits = logits.view(b, -1)
+            prob = torch.softmax(flat_center_logits, dim=1)
+            weighted_feat = (prob.unsqueeze(-1) * tokens).sum(dim=1)
+            ret["aux_logits"] = self.aux_head(weighted_feat)
+
+        return ret
+
+
+def _center_tv_loss(prob_volume):
+    """3D smoothness loss on probability volume."""
+    if prob_volume.dim() == 5:
+        p = prob_volume[:, 0]
+    else:
+        p = prob_volume
+    loss = (
+        (p[:, 1:, :, :] - p[:, :-1, :, :]).abs().mean()
+        + (p[:, :, 1:, :] - p[:, :, :-1, :]).abs().mean()
+        + (p[:, :, :, 1:] - p[:, :, :, :-1]).abs().mean()
+    )
+    return loss
+
+
+def _center_peak_loss(flat_prob):
+    """Encourage a single dominant peak in the center probability map."""
+    eps = 1e-8
+    pmax = flat_prob.max(dim=1).values
+    entropy = -(flat_prob * (flat_prob + eps).log()).sum(dim=1)
+    return (1.0 - pmax).mean() + 0.1 * entropy.mean()
+
+
+def _prepare_center_targets(center_label, grid_shape, original_size):
+    """Convert center labels to flattened pooled-grid indices.
+
+    Accepted formats:
+    - (B,) or (B,1): flattened pooled-grid indices
+    - (B,3): coordinates. Supports normalized [0,1], pooled-grid coords,
+      or original-volume coords (scaled to pooled grid).
+    """
+    d, h, w = grid_shape
+    device = center_label.device
+
+    if center_label.dim() == 1:
+        idx = center_label.long()
+        return torch.clamp(idx, 0, d * h * w - 1)
+
+    if center_label.dim() == 2 and center_label.shape[1] == 1:
+        idx = center_label[:, 0].long()
+        return torch.clamp(idx, 0, d * h * w - 1)
+
+    if center_label.dim() == 2 and center_label.shape[1] == 3:
+        coord = center_label.float()
+        maxv = float(coord.detach().max().item())
+        if maxv <= 1.5:
+            coord[:, 0] = coord[:, 0] * (d - 1)
+            coord[:, 1] = coord[:, 1] * (h - 1)
+            coord[:, 2] = coord[:, 2] * (w - 1)
+        elif maxv > max(d, h, w) + 0.5:
+            scale = torch.tensor(
+                [
+                    (d - 1) / max(original_size - 1, 1),
+                    (h - 1) / max(original_size - 1, 1),
+                    (w - 1) / max(original_size - 1, 1),
+                ],
+                device=device,
+                dtype=coord.dtype,
+            )
+            coord = coord * scale
+
+        z = coord[:, 0].round().long().clamp(0, d - 1)
+        y = coord[:, 1].round().long().clamp(0, h - 1)
+        x = coord[:, 2].round().long().clamp(0, w - 1)
+        return z * (h * w) + y * w + x
+
+    raise ValueError(
+        "center label must have shape (B,), (B,1), or (B,3) for center supervision"
+    )
+
+
 class ParticleID3DNet_Binary(L.LightningModule):
 
-    def __init__(self, num_classes=1, regression=False, small=False):
+    def __init__(
+        self,
+        num_classes=1,
+        regression=False,
+        small=False,
+        center_loss_weight=1.0,
+        center_smooth_weight=0.02,
+        center_peak_weight=0.05,
+        center_bottleneck_channels=128,
+        center_aux_enabled=True,
+        center_aux_loss_weight=0.2,
+    ):
         super().__init__()
         self.save_hyperparameters()
-        
-        # 3D convolutional backbone
+
         self.conv1 = nn.Conv3d(1, 16, kernel_size=5, padding=2)
         self.bn1 = nn.BatchNorm3d(16)
         self.conv1_1 = nn.Conv3d(16, 16, kernel_size=5, padding=2)
@@ -1597,13 +1855,27 @@ class ParticleID3DNet_Binary(L.LightningModule):
         self.conv3_1 = nn.Conv3d(64, 64, kernel_size=5, padding=2)
 
         self.pool = nn.MaxPool3d(2)
-        
-        if not small:
-            # After 3 poolings: 65 -> 32 -> 16 -> 8
-            self.fc1 = nn.Linear(64 * 8 * 8 * 8, 128)
-        else:
-            
+
+        # 3D convolutional backbone
+        # self.conv1 = nn.Conv3d(1, 32, kernel_size=5, padding=2)
+        # self.bn1 = nn.BatchNorm3d(32)
+        # self.conv1_1 = nn.Conv3d(32, 32, kernel_size=5, padding=2)
+
+        # self.conv2 = nn.Conv3d(32, 64, kernel_size=5, padding=2)
+        # self.bn2 = nn.BatchNorm3d(64)
+        # self.conv2_1 = nn.Conv3d(64, 64, kernel_size=5, padding=2)
+
+        # self.conv3 = nn.Conv3d(64, 128, kernel_size=5, padding=2)
+        # self.bn3 = nn.BatchNorm3d(128)
+        # self.conv3_1 = nn.Conv3d(128, 128, kernel_size=5, padding=2)
+
+        # self.pool = nn.MaxPool3d(2)
+
+        # After 3 poolings: 65 -> 32 -> 16 -> 8
+        if small:
             self.fc1 = nn.Linear(64 * 5 * 5 * 5, 128)
+        else:
+            self.fc1 = nn.Linear(64 * 8 * 8 * 8, 128)
 
         self.num_classes = num_classes
         self.regression = regression
@@ -1617,19 +1889,39 @@ class ParticleID3DNet_Binary(L.LightningModule):
             self.fc2 = nn.Linear(128, num_classes)
             self.criterion = nn.CrossEntropyLoss()
 
+        self.center_head = CenterHead3D(
+            in_channels=64,
+            bottleneck_channels=center_bottleneck_channels,
+            nhead=4,
+            num_layers=2,
+            aux_num_classes=(
+                None if regression else (1 if num_classes == 1 else num_classes)
+            ),
+            enable_aux_head=(center_aux_enabled and (not regression)),
+        )
+        self.center_criterion = nn.CrossEntropyLoss()
+        self.center_loss_weight = center_loss_weight
+        self.center_smooth_weight = center_smooth_weight
+        self.center_peak_weight = center_peak_weight
+        self.center_aux_enabled = center_aux_enabled and (not regression)
+        self.center_aux_loss_weight = center_aux_loss_weight
+
         self.training_step_outputs = []
         self.val_step_outputs = []
 
-    def forward(self, x):
+    def forward(self, x, return_center=False):
         x = self.pool(F.relu(self.bn1(self.conv1(x))))
         x = F.relu(self.conv1_1(x))
         x = self.pool(F.relu(self.bn2(self.conv2(x))))
         x = F.relu(self.conv2_1(x))
         x = self.pool(F.relu(self.bn3(self.conv3(x))))
-        x = F.relu(self.conv3_1(x))
-        x = torch.flatten(x, start_dim=1)
+        feat = F.relu(self.conv3_1(x))
+        x = torch.flatten(feat, start_dim=1)
         x = F.relu(self.fc1(x))
         out = self.fc2(x)
+        if return_center:
+            center_ret = self.center_head(feat)
+            return out, center_ret
         if self.regression:
             return out  # shape (B, num_regression)
         elif self.num_classes == 1:
@@ -1637,22 +1929,64 @@ class ParticleID3DNet_Binary(L.LightningModule):
         else:
             return out  # (B, num_classes)
 
+    def _center_losses(self, center_logits, center_label, original_size):
+        b, _, d, h, w = center_logits.shape
+        flat_logits = center_logits.view(b, -1)
+        target_idx = _prepare_center_targets(center_label, (d, h, w), original_size)
+        ce = self.center_criterion(flat_logits, target_idx)
+
+        flat_prob = torch.softmax(flat_logits, dim=1)
+        prob_vol = flat_prob.view(b, 1, d, h, w)
+        smooth = _center_tv_loss(prob_vol)
+        peak = _center_peak_loss(flat_prob)
+
+        pred_idx = flat_prob.argmax(dim=1)
+        center_acc = (pred_idx == target_idx).float().mean()
+        return ce, smooth, peak, center_acc
+
+    def _center_aux_loss(self, aux_logits, aux_label):
+        if self.regression:
+            return None, None
+        if self.num_classes == 1:
+            loss = F.binary_cross_entropy_with_logits(
+                aux_logits.squeeze(1), aux_label.float()
+            )
+            pred = (torch.sigmoid(aux_logits.squeeze(1)) > 0.5).float()
+            acc = (pred == aux_label.float()).float().mean()
+            return loss, acc
+        loss = F.cross_entropy(aux_logits, aux_label.long())
+        pred = aux_logits.argmax(dim=1)
+        acc = (pred == aux_label.long()).float().mean()
+        return loss, acc
+
     def shared_step(self, batch, stage, l):
-        x, y = batch
-        logits = self(x)
+        if isinstance(batch, (tuple, list)) and len(batch) >= 4:
+            x, y, center_label, aux_label = batch[0], batch[1], batch[2], batch[3]
+        elif isinstance(batch, (tuple, list)) and len(batch) >= 3:
+            x, y, center_label = batch[0], batch[1], batch[2]
+            aux_label = None
+        else:
+            x, y = batch
+            center_label = None
+            aux_label = None
+
+        logits, center_ret = self(x, return_center=True)
+        center_logits = center_ret["center_logits"]
         if self.regression:
             # y shape: (B, num_regression)
             loss = self.criterion(logits, y)
             l.append({"y": y.cpu().numpy(), "pre": logits.detach().cpu().numpy()})
-            return loss
         elif self.num_classes == 1:
             # Binary classification
+            if y.dim() == 2 and y.shape[1] == 1:
+                y = y.squeeze(1)
+            if logits.dim() == 2 and logits.shape[1] == 1:
+                logits = logits.squeeze(1)
             loss = self.criterion(logits, y.float())
             preds = torch.sigmoid(logits)
             predicted_classes = (preds > 0.5).float()
             acc = (predicted_classes == y).float().mean()
             l.append({"y": y.cpu().numpy(), "pre": preds.detach().cpu().numpy()})
-            return loss
         else:
             # Multiclass classification
             loss = self.criterion(logits, y.long())
@@ -1660,7 +1994,87 @@ class ParticleID3DNet_Binary(L.LightningModule):
             predicted_classes = torch.argmax(preds, dim=1)
             acc = (predicted_classes == y).float().mean()
             l.append({"y": y.cpu().numpy(), "pre": preds.detach().cpu().numpy()})
-            return loss
+
+        center_valid_mask = None
+        if not self.regression:
+            if self.num_classes == 1:
+                center_valid_mask = y > 0.5
+            else:
+                center_valid_mask = y.long() > 0
+
+        if center_label is not None:
+            if center_valid_mask is None:
+                center_valid_mask = torch.ones(
+                    center_logits.shape[0],
+                    dtype=torch.bool,
+                    device=center_logits.device,
+                )
+            else:
+                center_valid_mask = center_valid_mask.to(center_logits.device)
+
+            if bool(center_valid_mask.any()):
+                ce_c, smooth_c, peak_c, center_acc = self._center_losses(
+                    center_logits[center_valid_mask],
+                    center_label[center_valid_mask],
+                    x.shape[-1],
+                )
+                center_loss = (
+                    self.center_loss_weight * ce_c
+                    + self.center_smooth_weight * smooth_c
+                    + self.center_peak_weight * peak_c
+                )
+                loss = loss + center_loss
+                prefix = "train" if stage == "train" else "val"
+                self.log(
+                    f"{prefix}_center_loss",
+                    center_loss,
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=(stage != "train"),
+                )
+                self.log(f"{prefix}_center_ce", ce_c, on_step=False, on_epoch=True)
+                self.log(
+                    f"{prefix}_center_smooth", smooth_c, on_step=False, on_epoch=True
+                )
+                self.log(f"{prefix}_center_peak", peak_c, on_step=False, on_epoch=True)
+                self.log(
+                    f"{prefix}_center_acc", center_acc, on_step=False, on_epoch=True
+                )
+
+        if (
+            aux_label is not None
+            and self.center_aux_enabled
+            and ("aux_logits" in center_ret)
+        ):
+            aux_mask = center_valid_mask
+            if aux_mask is None:
+                aux_mask = torch.ones(
+                    aux_label.shape[0], dtype=torch.bool, device=aux_label.device
+                )
+            else:
+                aux_mask = aux_mask.to(aux_label.device)
+
+            if bool(aux_mask.any()):
+                aux_loss, aux_acc = self._center_aux_loss(
+                    center_ret["aux_logits"][aux_mask], aux_label[aux_mask]
+                )
+                if aux_loss is not None:
+                    loss = loss + self.center_aux_loss_weight * aux_loss
+                    prefix = "train" if stage == "train" else "val"
+                    self.log(
+                        f"{prefix}_center_aux_loss",
+                        aux_loss,
+                        on_step=False,
+                        on_epoch=True,
+                    )
+                    self.log(
+                        f"{prefix}_center_aux_acc",
+                        aux_acc,
+                        on_step=False,
+                        on_epoch=True,
+                    )
+
+        return loss
 
     def training_step(self, batch, batch_idx):
         return self.shared_step(batch, "train", self.training_step_outputs)
@@ -1685,10 +2099,8 @@ class ParticleID3DNet_Binary(L.LightningModule):
             aupr = auc(recall, precision)
             auroc = roc_auc_score(trues, preds)
             print("val_aupr", aupr, "val_auroc", auroc)
-            print("logging")
-            self.log_dict({"val_auroc":auroc, "val_aupr": aupr})
-            # self.log("val_auroc", auroc)
-            # self.log("val_aupr", aupr)
+            self.log("val_aupr", aupr)
+            self.log("val_auroc", auroc)
         else:
             from sklearn.metrics import accuracy_score, log_loss
 
@@ -1700,3 +2112,374 @@ class ParticleID3DNet_Binary(L.LightningModule):
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=1e-4, weight_decay=1e-5)
 
+
+# class ParticleID3DNet_Binary(L.LightningModule):
+
+#     def __init__(self, num_classes=1, regression=False, small=False):
+#         super().__init__()
+#         self.save_hyperparameters()
+
+#         # 3D convolutional backbone
+#         self.conv1 = nn.Conv3d(1, 16, kernel_size=5, padding=2)
+#         self.bn1 = nn.BatchNorm3d(16)
+#         self.conv1_1 = nn.Conv3d(16, 16, kernel_size=5, padding=2)
+
+#         self.conv2 = nn.Conv3d(16, 32, kernel_size=5, padding=2)
+#         self.bn2 = nn.BatchNorm3d(32)
+#         self.conv2_1 = nn.Conv3d(32, 32, kernel_size=5, padding=2)
+
+#         self.conv3 = nn.Conv3d(32, 64, kernel_size=5, padding=2)
+#         self.bn3 = nn.BatchNorm3d(64)
+#         self.conv3_1 = nn.Conv3d(64, 64, kernel_size=5, padding=2)
+
+#         self.pool = nn.MaxPool3d(2)
+
+#         if not small:
+#             # After 3 poolings: 65 -> 32 -> 16 -> 8
+#             self.fc1 = nn.Linear(64 * 8 * 8 * 8, 128)
+#         else:
+
+#             self.fc1 = nn.Linear(64 * 5 * 5 * 5, 128)
+
+#         self.num_classes = num_classes
+#         self.regression = regression
+#         if regression:
+#             self.fc2 = nn.Linear(128, num_classes)  # output dim = regression dim
+#             self.criterion = nn.MSELoss()
+#         elif num_classes == 1:
+#             self.fc2 = nn.Linear(128, 1)
+#             self.criterion = nn.BCEWithLogitsLoss()
+#         else:
+#             self.fc2 = nn.Linear(128, num_classes)
+#             self.criterion = nn.CrossEntropyLoss()
+
+#         self.training_step_outputs = []
+#         self.val_step_outputs = []
+
+#     def forward(self, x):
+#         x = self.pool(F.relu(self.bn1(self.conv1(x))))
+#         x = F.relu(self.conv1_1(x))
+#         x = self.pool(F.relu(self.bn2(self.conv2(x))))
+#         x = F.relu(self.conv2_1(x))
+#         x = self.pool(F.relu(self.bn3(self.conv3(x))))
+#         x = F.relu(self.conv3_1(x))
+#         x = torch.flatten(x, start_dim=1)
+#         x = F.relu(self.fc1(x))
+#         out = self.fc2(x)
+#         if self.regression:
+#             return out  # shape (B, num_regression)
+#         elif self.num_classes == 1:
+#             return out.squeeze(1)  # (B,)
+#         else:
+#             return out  # (B, num_classes)
+
+#     def shared_step(self, batch, stage, l):
+#         x, y = batch
+#         logits = self(x)
+#         if self.regression:
+#             # y shape: (B, num_regression)
+#             loss = self.criterion(logits, y)
+#             l.append({"y": y.cpu().numpy(), "pre": logits.detach().cpu().numpy()})
+#             return loss
+#         elif self.num_classes == 1:
+#             # Binary classification
+#             loss = self.criterion(logits, y.float())
+#             preds = torch.sigmoid(logits)
+#             predicted_classes = (preds > 0.5).float()
+#             acc = (predicted_classes == y).float().mean()
+#             l.append({"y": y.cpu().numpy(), "pre": preds.detach().cpu().numpy()})
+#             return loss
+#         else:
+#             # Multiclass classification
+#             loss = self.criterion(logits, y.long())
+#             preds = torch.softmax(logits, dim=1)
+#             predicted_classes = torch.argmax(preds, dim=1)
+#             acc = (predicted_classes == y).float().mean()
+#             l.append({"y": y.cpu().numpy(), "pre": preds.detach().cpu().numpy()})
+#             return loss
+
+#     def training_step(self, batch, batch_idx):
+#         return self.shared_step(batch, "train", self.training_step_outputs)
+
+#     def validation_step(self, batch, batch_idx):
+#         self.shared_step(batch, "val", self.val_step_outputs)
+
+#     def on_train_epoch_end(self):
+#         self.training_step_outputs.clear()
+
+#     def on_validation_epoch_end(self):
+#         preds = np.concatenate([x["pre"] for x in self.val_step_outputs], axis=0)
+#         trues = np.concatenate([x["y"] for x in self.val_step_outputs], axis=0)
+#         if self.regression:
+#             # For regression, print MSE
+#             mse = np.mean((preds - trues) ** 2)
+#             print("val_mse", mse)
+#         elif self.num_classes == 1:
+#             from sklearn.metrics import auc, precision_recall_curve, roc_auc_score
+
+#             precision, recall, thresholds = precision_recall_curve(trues, preds)
+#             aupr = auc(recall, precision)
+#             auroc = roc_auc_score(trues, preds)
+#             print("val_aupr", aupr, "val_auroc", auroc)
+#             print("logging")
+#             self.log_dict({"val_auroc": auroc, "val_aupr": aupr})
+#             # self.log("val_auroc", auroc)
+#             # self.log("val_aupr", aupr)
+#         else:
+#             from sklearn.metrics import accuracy_score, log_loss
+
+#             acc = accuracy_score(trues, np.argmax(preds, axis=1))
+#             ce = log_loss(trues, preds)
+#             print("val_acc", acc, "val_ce", ce)
+#         self.val_step_outputs.clear()
+
+#     def configure_optimizers(self):
+#         return torch.optim.Adam(self.parameters(), lr=1e-4, weight_decay=1e-5)
+
+
+class Particle3DNet(L.LightningModule):
+    """Residual 3D CNN for multiclass particle identification in tomograms.
+
+    Design:
+    - 6 Conv3D layers total (implemented as 3 residual blocks, each block has 2 convs).
+    - Spatial downsampling by factor 2 after every residual block.
+    - Supports 65^3 and 41^3 inputs in one implementation via adaptive pooling.
+    """
+
+    def __init__(
+        self,
+        num_classes=13,
+        input_size=65,
+        channels=(32, 64, 128),
+        dropout=0.2,
+        lr=2e-4,
+        weight_decay=1e-4,
+        class_weights=None,
+        label_smoothing=0.01,
+        center_loss_weight=1.0,
+        center_smooth_weight=0.02,
+        center_peak_weight=0.1,
+        center_bottleneck_channels=128,
+        center_aux_enabled=True,
+        center_aux_loss_weight=0.2,
+    ):
+        super().__init__()
+        self.save_hyperparameters(ignore=["class_weights"])
+
+        if input_size not in (41, 65):
+            raise ValueError("input_size must be either 41 or 65")
+        if len(channels) != 3:
+            raise ValueError("channels must provide 3 stages, e.g. (32, 64, 128)")
+
+        c1, c2, c3 = channels
+        self.num_classes = num_classes
+        self.input_size = input_size
+        self.lr = lr
+        self.weight_decay = weight_decay
+
+        # 6 conv layers in total: 2 convs per block x 3 blocks.
+        self.block1 = Residual3DBlock(1, c1, dropout=dropout)
+        self.block2 = Residual3DBlock(c1, c2, dropout=dropout)
+        self.block3 = Residual3DBlock(c2, c3, dropout=dropout)
+
+        self.pool = nn.MaxPool3d(kernel_size=2, stride=2)
+        self.global_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(c3, c3 // 2),
+            nn.SiLU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(c3 // 2, num_classes),
+        )
+        self.center_head = CenterHead3D(
+            in_channels=c3,
+            bottleneck_channels=center_bottleneck_channels,
+            nhead=4,
+            num_layers=2,
+            aux_num_classes=num_classes,
+            enable_aux_head=center_aux_enabled,
+        )
+        self.center_criterion = nn.CrossEntropyLoss()
+        self.center_loss_weight = center_loss_weight
+        self.center_smooth_weight = center_smooth_weight
+        self.center_peak_weight = center_peak_weight
+        self.center_aux_enabled = center_aux_enabled
+        self.center_aux_loss_weight = center_aux_loss_weight
+
+        cw = None
+        if class_weights is not None:
+            cw = torch.tensor(class_weights, dtype=torch.float32)
+            if cw.numel() != num_classes:
+                raise ValueError("class_weights length must match num_classes")
+
+        self.register_buffer(
+            "class_weights_buffer",
+            cw if cw is not None else torch.ones(num_classes, dtype=torch.float32),
+            persistent=True,
+        )
+        self.criterion = nn.CrossEntropyLoss(
+            weight=self.class_weights_buffer,
+            label_smoothing=label_smoothing,
+        )
+
+        self.train_acc = torchmetrics.Accuracy(
+            task="multiclass", num_classes=num_classes, average="macro"
+        )
+        self.val_acc = torchmetrics.Accuracy(
+            task="multiclass", num_classes=num_classes, average="macro"
+        )
+        self.val_f1 = torchmetrics.F1Score(
+            task="multiclass", num_classes=num_classes, average="macro"
+        )
+
+    def forward(self, x, return_center=False):
+        if x.dim() != 5:
+            raise ValueError("Expected input of shape (B, C, D, H, W)")
+        if x.shape[1] != 1:
+            raise ValueError("Particle3DNet expects single-channel input (C=1)")
+
+        s = x.shape[-1]
+        if s not in (41, 65):
+            raise ValueError("Particle3DNet supports cubic inputs of 41 or 65")
+
+        x = self.block1(x)
+        x = self.pool(x)
+
+        x = self.block2(x)
+        x = self.pool(x)
+
+        x = self.block3(x)
+        x = self.pool(x)
+
+        center_ret = self.center_head(x)
+        x = self.global_pool(x)
+        logits = self.classifier(x)
+        if return_center:
+            return logits, center_ret
+        return logits
+
+    def _center_losses(self, center_logits, center_label, original_size):
+        b, _, d, h, w = center_logits.shape
+        flat_logits = center_logits.view(b, -1)
+        target_idx = _prepare_center_targets(center_label, (d, h, w), original_size)
+        ce = self.center_criterion(flat_logits, target_idx)
+
+        flat_prob = torch.softmax(flat_logits, dim=1)
+        prob_vol = flat_prob.view(b, 1, d, h, w)
+        smooth = _center_tv_loss(prob_vol)
+        peak = _center_peak_loss(flat_prob)
+
+        pred_idx = flat_prob.argmax(dim=1)
+        center_acc = (pred_idx == target_idx).float().mean()
+        return ce, smooth, peak, center_acc
+
+    def _center_aux_loss(self, aux_logits, aux_label):
+        loss = F.cross_entropy(aux_logits, aux_label.long())
+        pred = aux_logits.argmax(dim=1)
+        acc = (pred == aux_label.long()).float().mean()
+        return loss, acc
+
+    def shared_step(self, batch, stage="train"):
+        if isinstance(batch, (tuple, list)) and len(batch) >= 4:
+            x, y, center_label, aux_label = batch[0], batch[1], batch[2], batch[3]
+        elif isinstance(batch, (tuple, list)) and len(batch) >= 3:
+            x, y, center_label = batch[0], batch[1], batch[2]
+            aux_label = None
+        else:
+            x, y = batch
+            center_label = None
+            aux_label = None
+
+        logits, center_ret = self(x, return_center=True)
+        center_logits = center_ret["center_logits"]
+        y = y.long()
+        loss = self.criterion(logits, y)
+
+        if center_label is not None:
+            ce_c, smooth_c, peak_c, center_acc = self._center_losses(
+                center_logits, center_label, x.shape[-1]
+            )
+            loss = (
+                loss
+                + self.center_loss_weight * ce_c
+                + self.center_smooth_weight * smooth_c
+                + self.center_peak_weight * peak_c
+            )
+
+        if (
+            aux_label is not None
+            and self.center_aux_enabled
+            and ("aux_logits" in center_ret)
+        ):
+            aux_loss, aux_acc = self._center_aux_loss(
+                center_ret["aux_logits"], aux_label
+            )
+            loss = loss + self.center_aux_loss_weight * aux_loss
+
+        probs = torch.softmax(logits, dim=1)
+        if stage == "train":
+            acc = self.train_acc(probs, y)
+            self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
+            self.log("train_acc", acc, prog_bar=True, on_step=False, on_epoch=True)
+            if center_label is not None:
+                self.log("train_center_ce", ce_c, on_step=False, on_epoch=True)
+                self.log("train_center_smooth", smooth_c, on_step=False, on_epoch=True)
+                self.log("train_center_peak", peak_c, on_step=False, on_epoch=True)
+                self.log("train_center_acc", center_acc, on_step=False, on_epoch=True)
+            if (
+                aux_label is not None
+                and self.center_aux_enabled
+                and ("aux_logits" in center_ret)
+            ):
+                self.log(
+                    "train_center_aux_loss", aux_loss, on_step=False, on_epoch=True
+                )
+                self.log("train_center_aux_acc", aux_acc, on_step=False, on_epoch=True)
+        elif stage == "val":
+            acc = self.val_acc(probs, y)
+            f1 = self.val_f1(probs, y)
+            self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+            self.log("val_acc", acc, prog_bar=True, on_step=False, on_epoch=True)
+            self.log("val_f1", f1, prog_bar=True, on_step=False, on_epoch=True)
+            if center_label is not None:
+                self.log("val_center_ce", ce_c, on_step=False, on_epoch=True)
+                self.log("val_center_smooth", smooth_c, on_step=False, on_epoch=True)
+                self.log("val_center_peak", peak_c, on_step=False, on_epoch=True)
+                self.log("val_center_acc", center_acc, on_step=False, on_epoch=True)
+            if (
+                aux_label is not None
+                and self.center_aux_enabled
+                and ("aux_logits" in center_ret)
+            ):
+                self.log("val_center_aux_loss", aux_loss, on_step=False, on_epoch=True)
+                self.log("val_center_aux_acc", aux_acc, on_step=False, on_epoch=True)
+        return loss
+
+    def training_step(self, batch, batch_idx):
+        return self.shared_step(batch, stage="train")
+
+    def validation_step(self, batch, batch_idx):
+        return self.shared_step(batch, stage="val")
+
+    def test_step(self, batch, batch_idx):
+        return self.shared_step(batch, stage="val")
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(
+            self.parameters(), lr=self.lr, weight_decay=self.weight_decay
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=10,
+            T_mult=2,
+            eta_min=self.lr * 0.05,
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+                "frequency": 1,
+            },
+        }

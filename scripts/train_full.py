@@ -28,6 +28,7 @@ import json
 import os
 import sys
 
+sys.path.append("/home/feity/cryoem/src")
 sys.path.append("../src")
 
 import pytorch_lightning as L
@@ -109,8 +110,10 @@ def run() -> None:
     L.seed_everything(configs["seed"])
 
     print("building model")
-
-    configs["model"]["stage"] = "stage 1 mask"
+    if configs["model"]["name"] == "detr":
+        configs["model"]["stage"] = "stage 1"
+    else:
+        configs["model"]["stage"] = "stage 1 mask"
     configs["model"]["mask_in_channels"] = 1
     configs["training"]["scheduler_step"] = configs["training"]["epochs"][0] // 3
     configs["training"]["lr_backbone"] = 4e-5
@@ -198,8 +201,13 @@ def run() -> None:
         #     trainer.fit(model, ds, ckpt_path=args.checkpoint)
         # else:
         if os.path.exists(os.path.join(args.path, "stage1", "last.ckpt")):
-            print("resuming from checkpoint ", os.path.join(args.path, "stage1", "last.ckpt"))
-            trainer.fit(model, ds, ckpt_path=os.path.join(args.path, "stage1", "last.ckpt"))
+            print(
+                "resuming from checkpoint ",
+                os.path.join(args.path, "stage1", "last.ckpt"),
+            )
+            trainer.fit(
+                model, ds, ckpt_path=os.path.join(args.path, "stage1", "last.ckpt")
+            )
         else:
             trainer.fit(model, ds)
         print("finish training stage 1")
@@ -265,10 +273,20 @@ def run() -> None:
         )
 
         print("start training stage 2")
+        if os.path.exists(os.path.join(args.path, "stage2", "last.ckpt")):
+            print(
+                "resuming from checkpoint ",
+                os.path.join(args.path, "stage2", "last.ckpt"),
+            )
+            trainer.fit(
+                model, ds, ckpt_path=os.path.join(args.path, "stage2", "last.ckpt")
+            )
+        else:
+            trainer.fit(model, ds)
         # if args.checkpoint is not None:
         #     trainer.fit(model, ds, ckpt_path=args.checkpoint)
         # else:
-        trainer.fit(model, ds)
+        # trainer.fit(model, ds)
         print("finish training stage 2")
     else:
         print("skip training stage 2")

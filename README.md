@@ -25,17 +25,27 @@ tomoGNN is a pipeline for slice-wise detection and mask refinement in cryo-elect
   - `scan_organelle.ipynb` – Organelle detection and mask refinement
 - `datasets/` – Place dataset pickle files here (not included)
 
+## Hugging Face Assets
+Example data and trained models used by notebooks in this repository are available on Hugging Face:
+
+- Repository: [tyfei216/TomoGNN](https://huggingface.co/tyfei216/TomoGNN)
+- Contents: notebook-ready example tomograms/labels and pretrained checkpoints for workflows under `notebooks/`
+
+Use these assets if you want to run the notebook pipelines without preparing all data and weights from scratch.
+
 ## Installation
 Requirements (typical): Python ≥ 3.9, CUDA-capable GPU (optional but recommended), PyTorch, PyTorch Lightning.
 
 ```bash
-# Create and activate a virtual environment (choose one)
-python -m venv .venv && source .venv/bin/activate
-# or: conda create -n tomognn python=3.10 -y && conda activate tomognn
+# Create and activate conda environment
+conda create -n pytorch python=3.12 -y
+conda activate pytorch
 
-# Install dependencies (adjust torch version/CUDA as needed)
+# Install PyTorch (adjust CUDA build as needed)
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-pip install pytorch-lightning tqdm numpy scipy pandas matplotlib scikit-image scikit-learn networkx
+
+# Install project dependencies
+pip install -r requirements.txt
 ```
 
 ## Data Format (Dataset Pickle)

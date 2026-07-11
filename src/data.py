@@ -634,10 +634,11 @@ class MrcDataset(Dataset):
         gap=5,
         length_for_average=10,
         require_mask=False,
-        mask_length=5,
-        mask_input_channels=11,
+        mask_length=1,
+        mask_input_channels=3,
         add_classname=False,
-        filtermin=5,
+        filtermin=0,
+        zpos_max=None,
         use_ori=True,
     ):
         print("reading dataset:", annotation_path)
@@ -645,6 +646,7 @@ class MrcDataset(Dataset):
             self.annotation = pickle.load(f)
 
         self.ori_mrc = utils.readTomogram(self.annotation["mrc_path"])
+        self.zpos_max = self.ori_mrc.shape[0]
         self.norm = norm
         self.maxsize = reshape
 
@@ -660,6 +662,8 @@ class MrcDataset(Dataset):
 
         self.gap = gap
         self.filtermin = filtermin
+        if zpos_max is not None:
+            self.zpos_max = zpos_max
 
         self.needids = None
 
@@ -957,6 +961,7 @@ class MrcDataset(Dataset):
         )
 
         target["pos"] = zpos
+        target["zposmax"] = self.zpos_max
         # print(target["class_labels"])
         for i in ["names", "item_id"]:
             if i in target:
@@ -1028,7 +1033,12 @@ class MrcDataset2(MrcDataset):
 
 class MrcDataModule(L.LightningDataModule):
     def __init__(
-        self, trainsets, valsets, train_batch_size, val_batch_size, stack_batch=True
+        self,
+        trainsets,
+        valsets,
+        train_batch_size,
+        val_batch_size,
+        stack_batch=True,
     ):
         super().__init__()
         self.train_batch_size = train_batch_size
@@ -1170,16 +1180,26 @@ class CocoDataModule(L.LightningDataModule):
 
 class TestDatasetMrc(Dataset):
     def __init__(
-        self, mrc_path, norm="hist", reshape=800, gap=5, length_for_average=10
+        self,
+        mrc_path,
+        norm="hist",
+        reshape=800,
+        gap=5,
+        length_for_average=10,
+        zpos_max=None,
     ):
-        print("test dataset")
+        print("loading test dataset")
         self.mrc_path = mrc_path
         self.ori_mrc = utils.readTomogram(mrc_path)
+
+        self.zpos_max = self.ori_mrc.shape[0]
 
         self.norm = norm
         self.reshape = reshape
         self.gap = gap
         self.length_for_average = length_for_average
+        if zpos_max is not None:
+            self.zpos_max = zpos_max
 
         self.start_pos = 0
         self.end_pos = len(self.ori_mrc)
@@ -1237,16 +1257,25 @@ class TestDatasetMrc(Dataset):
             wq = w if w < self.reshape else self.reshape
             wq = wq / w
             r = min(hq, wq)
-            # print(r, (int(r * h), int(r * w)))
-            # print(img.shape)
-            trans = transforms.Resize((int(r * h), int(r * w)))
-            # print(trans)
-            # print(img.shape)
+            new_h = max(1, int(r * h))
+            new_w = max(1, int(r * w))
+            img = transforms.Resize((new_h, new_w))(img)
+            h, w = new_h, new_w
+        elif h < self.reshape and w < self.reshape:
+            # Upscale when both sides are smaller so the shorter side reaches `reshape`.
+            r = self.reshape / min(h, w)
+            new_h = max(1, int(r * h))
+            new_w = max(1, int(r * w))
+            img = transforms.Resize((new_h, new_w))(img)
+            h, w = new_h, new_w
 
-            img = trans(img)
-            # print(img.shape)
-            h = int(r * h)
-            w = int(r * w)
+            # If upscaling makes one side exceed `reshape`, crop to keep output shape stable.
+            if h > self.reshape:
+                img = img[:, : self.reshape, :]
+                h = self.reshape
+            if w > self.reshape:
+                img = img[:, :, : self.reshape]
+                w = self.reshape
 
         mask = torch.zeros((self.reshape, self.reshape), dtype=torch.long)
         mask[:h, :w] = 1
@@ -1265,7 +1294,7 @@ class TestDatasetMrc(Dataset):
         return {
             "pixel_values": img,
             "pixel_mask": mask,
-            "labels": {"pos": idx, "zposmax": 500, "class_labels": None},
+            "labels": {"pos": idx, "zposmax": self.zpos_max, "class_labels": None},
         }
 
 
@@ -1852,14 +1881,23 @@ class Particle3DDataset(Dataset):
     """
 
     def __init__(
-        self, df, tomo_paths, crop_size=65, norm=None, r=0, if_augmentation=True, norm_sample=False
+        self,
+        df,
+        tomo_paths,
+        crop_size=65,
+        norm=None,
+        r=0,
+        if_augmentation=True,
+        output_center=False,
+        norm_sample=False,
     ):
         self.df = df.reset_index(drop=True)
         self.crop_size = crop_size
         self.norm = norm
         self.r = r
-        self.norm_sample = norm_sample
         self.if_augmentation = if_augmentation
+        self.output_center = output_center
+        self.norm_sample = norm_sample
         self.loaded_volumes = {}
         for name in tomo_paths:
             path = tomo_paths[name]
@@ -1885,7 +1923,8 @@ class Particle3DDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        z, y, x = int(row["z"]), int(row["y"]), int(row["x"])
+        z0, y0, x0 = int(row["z"]), int(row["y"]), int(row["x"])
+        z, y, x = z0, y0, x0
         label = int(row["label"])
         tomo_path = row["tomogram"]
         vol = self._get_volume(tomo_path)
@@ -1914,14 +1953,43 @@ class Particle3DDataset(Dataset):
         cz1, cy1, cx1 = sz - (z - z1), sz - (y - y1), sz - (x - x1)
         cz2, cy2, cx2 = cz1 + (z2 - z1), cy1 + (y2 - y1), cx1 + (x2 - x1)
         crop[cz1:cz2, cy1:cy2, cx1:cx2] = vol[z1:z2, y1:y2, x1:x2]
+
+        # Track true particle center location inside the crop volume.
+        center_z = int(cz1 + (z0 - z1))
+        center_y = int(cy1 + (y0 - y1))
+        center_x = int(cx1 + (x0 - x1))
+        center_z = int(np.clip(center_z, 0, self.crop_size - 1))
+        center_y = int(np.clip(center_y, 0, self.crop_size - 1))
+        center_x = int(np.clip(center_x, 0, self.crop_size - 1))
+
+        flip_axes = []
+        k = 0
         if self.if_augmentation:
             # Flip along axes
             for axis in range(3):
                 if np.random.rand() < 0.5:
                     crop = np.flip(crop, axis=axis)
+                    flip_axes.append(axis)
             # Random 90-degree rotation about z axis
             k = np.random.randint(0, 4)
             crop = np.rot90(crop, k=k, axes=(1, 2))
+
+            # Apply same geometric transforms to center coordinates.
+            n = self.crop_size
+            if 0 in flip_axes:
+                center_z = n - 1 - center_z
+            if 1 in flip_axes:
+                center_y = n - 1 - center_y
+            if 2 in flip_axes:
+                center_x = n - 1 - center_x
+
+            if k == 1:
+                center_y, center_x = n - 1 - center_x, center_y
+            elif k == 2:
+                center_y, center_x = n - 1 - center_y, n - 1 - center_x
+            elif k == 3:
+                center_y, center_x = center_x, n - 1 - center_y
+
         crop = crop.astype(np.float32)
         crop = np.expand_dims(crop, 0)  # (1, D, H, W)
         if self.norm_sample:
@@ -1929,8 +1997,16 @@ class Particle3DDataset(Dataset):
                 crop = (crop - crop.mean()) / (crop.std() + 1e-6)
             elif self.norm == "hist":
                 from skimage import exposure
+
                 crop = exposure.equalize_hist(crop[0])[None, ...]  # (1, D, H, W)
-        
+
+        if self.output_center:
+            center = torch.tensor([center_z, center_y, center_x], dtype=torch.float32)
+            return (
+                torch.from_numpy(crop),
+                torch.tensor(label, dtype=torch.float32),
+                center,
+            )
         return torch.from_numpy(crop), torch.tensor(label, dtype=torch.float32)
 
 
@@ -2072,3 +2148,12 @@ class Particle3DOrientationDataset(Dataset):
         # Ensure angles are in [0, 360)
         new_angles = np.mod(new_angles, 360)
         return new_angles.astype(np.float32)
+
+
+def collate_with_aux(batch):
+    # 4-tuple to activate: main cls + center localization + center-weighted aux classifier
+    x = torch.stack([b[0] for b in batch], dim=0)
+    y = torch.stack([b[1] for b in batch], dim=0).long()
+    center = torch.stack([b[2] for b in batch], dim=0).float()
+    aux_label = y.clone()
+    return x, y, center, aux_label

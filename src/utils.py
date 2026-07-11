@@ -13,7 +13,10 @@ import torch
 import torch.nn as nn
 import torchvision
 import torchvision.transforms.v2 as transforms
+from scipy.optimize import linear_sum_assignment
+from scipy.sparse import csr_matrix
 from sklearn.cluster import DBSCAN
+from sklearn.metrics import precision_recall_curve
 from sklearn.neighbors import NearestNeighbors
 from torch_geometric.data import Data
 from torchvision.tv_tensors import BoundingBoxes, Mask
@@ -46,7 +49,7 @@ int_colors = [
 ]
 
 
-def  drawannotation(image, target, box=True, mask=True, font_size=30, color=None):
+def drawannotation(image, target, box=True, mask=True, font_size=30, color=None):
     import matplotlib.pyplot as plt
     from torchvision.utils import draw_bounding_boxes, draw_segmentation_masks
 
@@ -59,7 +62,7 @@ def  drawannotation(image, target, box=True, mask=True, font_size=30, color=None
         image = (image * 255).type(torch.uint8)
 
     if "masks" in target and mask:
-        print("masks")
+        print("adding masks")
         if target["masks"].dim() > 3:
             target["masks"] = target["masks"].squeeze()
         if target["masks"].dtype != torch.bool:
@@ -309,12 +312,27 @@ def processSingle(model, label, data, target_size, thres, has_none, empty=5, nms
     #         _output = output[i]
     #     else:
     #         _output = output
-    logits = output["logits"].squeeze(0)
-    pred_boxes = output["pred_boxes"].squeeze(0)
+    logits = output["logits"].squeeze(0).detach().cpu()
+    pred_boxes = output["pred_boxes"].squeeze(0).detach().cpu()
+    embed = output["last_hidden_state"].squeeze(0).detach().cpu()
+    device = torch.device("cpu")
+
+    # Keep matcher inputs on the same device as model outputs.
+    label_device = label.copy()
+    for k in ["class_labels", "boxes", "masks", "pos"]:
+        if k in label_device and isinstance(label_device[k], torch.Tensor):
+            label_device[k] = label_device[k].cpu()
+
     if nms > 0.1:
-        keep = bbnms(nms, convertBoxes(pred_boxes), logits[:, :empty].max(axis=1).values, torch.argmax(logits[:, :empty], axis=1))
+        keep = bbnms(
+            nms,
+            convertBoxes(pred_boxes),
+            logits[:, :empty].max(axis=1).values,
+            torch.argmax(logits[:, :empty], axis=1),
+        )
         pred_boxes = pred_boxes[keep]
         logits = logits[keep]
+        embed = embed[keep]
     if has_none:
         # print(logits, logits.shape)
         prob = torch.softmax(logits, -1)
@@ -329,14 +347,17 @@ def processSingle(model, label, data, target_size, thres, has_none, empty=5, nms
         reserve = reserve > thres
         reserve = reserve.any(dim=1)
 
-    if label["class_labels"] is not None and len(label["class_labels"]) == 0:
-        label["class_labels"] = None
+    if (
+        label_device["class_labels"] is not None
+        and len(label_device["class_labels"]) == 0
+    ):
+        label_device["class_labels"] = None
 
-    if label["class_labels"] is not None:
+    if label_device["class_labels"] is not None:
         o = {}
         o["pred_boxes"] = pred_boxes.unsqueeze(0)
         o["logits"] = logits.unsqueeze(0)
-        match_res = matcher(o, [label])
+        match_res = matcher(o, [label_device])
         match_res = match_res[0]
         r = torch.zeros_like(reserve, dtype=torch.bool)
         r[match_res[0]] = True
@@ -348,18 +369,23 @@ def processSingle(model, label, data, target_size, thres, has_none, empty=5, nms
 
     # v, pos = torch.max(prob, dim=1)
     logits = logits[reserve]
+    if has_none:
+        logits = logits[:, :-1]
+        # logit = logits_i
+    else:
+        logits = logits
     pred_boxes = pred_boxes[reserve]
-    embed = output["last_hidden_state"].squeeze(0)
+    # embed = output["last_hidden_state"].squeeze(0)
     embed = embed[reserve]
 
-    pos = torch.zeros((pred_boxes.shape[0], 5))
-    pos[:, 0] = label["pos"]
+    pos = torch.zeros((pred_boxes.shape[0], 5), device=device)
+    pos[:, 0] = label_device["pos"]
     # if label["pos"] > 249 and label["pos"] < 255:
     #     print(label["pos"])
-    if "zposmax" in label:
-        if label["zposmax"] == 0:
-            label["zposmax"] = 500
-        pos[:, 0] /= label["zposmax"]
+    if "zposmax" in label_device:
+        if label_device["zposmax"] == 0:
+            label_device["zposmax"] = 500
+        pos[:, 0] /= label_device["zposmax"]
     else:
         pos[:, 0] /= 500
     # print(pred_boxes)
@@ -369,37 +395,37 @@ def processSingle(model, label, data, target_size, thres, has_none, empty=5, nms
     pos[:, 4] = pred_boxes[:, 3]  # * (label["size"][1] / target_size[1])
     input = torch.concat([pos, logits, embed], dim=1)
     ret.append(input)
-    targets = torch.zeros((pred_boxes.shape[0]), dtype=torch.long)
+    targets = torch.zeros((pred_boxes.shape[0]), dtype=torch.long, device=device)
     targets.fill_(empty)
-    box_mask = torch.zeros((pred_boxes.shape[0]), dtype=torch.bool)
-    boxes = torch.zeros((pred_boxes.shape[0], 4))
+    box_mask = torch.zeros((pred_boxes.shape[0]), dtype=torch.bool, device=device)
+    boxes = torch.zeros((pred_boxes.shape[0], 4), device=device)
     item_id = ["" for i in range(pred_boxes.shape[0])]
 
-    if label["class_labels"] is not None:
-        if len(label["class_labels"]) > 0:
+    if label_device["class_labels"] is not None:
+        if len(label_device["class_labels"]) > 0:
             o = {}
             o["pred_boxes"] = pred_boxes.unsqueeze(0)
             o["logits"] = logits.unsqueeze(0)
             # print(o, label[i])
-            match_res = matcher(o, [label])
+            match_res = matcher(o, [label_device])
             match_res = match_res[0]
-            target = label["class_labels"]
+            target = label_device["class_labels"]
             target = target[match_res[1]]
             # print(targets, target)
-            target_boxes = label["boxes"]
+            target_boxes = label_device["boxes"]
             target_boxes = target_boxes[match_res[1]]
 
-            if "item_id" in label:
+            if "item_id" in label_device:
                 for s, t in zip(match_res[0], match_res[1]):
-                    item_id[s] = label["item_id"][t]
+                    item_id[s] = label_device["item_id"][t]
 
             boxes[match_res[0]] = target_boxes
             box_mask[match_res[0]] = True
             # print(box_mask.shape, boxes.shape)
             targets[match_res[0]] = target
 
-            if "masks" in label:
-                masks.append(label["masks"][match_res[1]])
+            if "masks" in label_device:
+                masks.append(label_device["masks"][match_res[1]])
 
     l.append(targets)
     box_masks.append(box_mask)
@@ -414,8 +440,9 @@ def processSingle(model, label, data, target_size, thres, has_none, empty=5, nms
         "item_id": item_ids,
         "masks": masks,
     }
-    
-def pickout(dict, pos, gap, length, min_id = None, max_id = None):
+
+
+def pickout(dict, pos, gap, length, min_id=None, max_id=None):
     keys = np.array(sorted(dict.keys()))
 
     if length <= 0 or len(keys) == 0:
@@ -458,13 +485,14 @@ def pickout(dict, pos, gap, length, min_id = None, max_id = None):
 
 
 def runStage1(
-    model, 
+    model,
     dataset,
     target_size,
     has_none=False,
+    filter_prob=0.05,
     empty=5,
     seed=None,
-    nms = -1.0
+    nms=-1.0,
 ):
     ret = {}
     for i in tqdm(range(dataset.start_pos, dataset.end_pos)):
@@ -475,12 +503,13 @@ def runStage1(
         label = data["labels"]
         with torch.no_grad():
             _ret_dict = processSingle(
-                model, label, data, target_size, 0.0, has_none, empty, nms
+                model, label, data, target_size, filter_prob, has_none, empty, nms
             )
 
         ret[i] = _ret_dict
     # print("finish dataset")
     return ret
+
 
 def buildStage2(
     model,
@@ -493,7 +522,7 @@ def buildStage2(
     has_none=False,
     empty=5,
     seed=None,
-    nms = -1.0,
+    nms=-1.0,
 ):
     ret = []
     l = []
@@ -525,7 +554,7 @@ def buildStage2(
         label = data["labels"]
         with torch.no_grad():
             _ret_dict = processSingle(
-                model, label, data, target_size, thres, has_none, empty
+                model, label, data, target_size, thres, has_none, empty, nms=nms
             )
 
         for j in _ret_dict:
@@ -624,14 +653,16 @@ def unique_random_sample_indices(weights, num_samples):
     return sampled_indices
 
 
-
-def process(outputs, labels, empty=4, need_mask=False, nms = -1.0):
+def process(
+    outputs, labels, empty=4, need_mask=False, nms=-1.0, has_none=False, thres=-1.0
+):
     ret = []
     boxeses = []
     box_masks = []
     l = []
     item_ids = []
     mask = []
+    positions = [0]
     logits = outputs["logits"]
     device = logits.device
     slice_num, num_obj, _ = logits.shape
@@ -646,13 +677,45 @@ def process(outputs, labels, empty=4, need_mask=False, nms = -1.0):
         embed = outputs["last_hidden_state"][i]
         if nms > 0.1:
             # print("using nms")
-            keep = bbnms(nms, convertBoxes(pred_boxes_i), logits_i[:, :empty].max(axis=1).values, torch.argmax(logits_i[:, :empty], axis=1))
+            keep = bbnms(
+                nms,
+                convertBoxes(pred_boxes_i),
+                logits_i[:, :empty].max(axis=1).values,
+                torch.argmax(logits_i[:, :empty], axis=1),
+            )
             pred_boxes_i = pred_boxes_i[keep]
             logits_i = logits_i[keep]
             embed = embed[keep]
             # print(pred_boxes_i)
             # print(logits_i)
-        match_res = matcher({"pred_boxes": pred_boxes_i.unsqueeze(0), "logits": logits_i.unsqueeze(0)}, [labels[i]])
+        if thres > 0.0:
+            if has_none:
+                prob = torch.softmax(logits_i, -1)
+                prob = prob[:, :-1]
+            else:
+                prob = torch.sigmoid(logits_i)
+            v, pos = torch.max(prob, dim=1)
+            reserve = v > thres
+            match_res = matcher(
+                {
+                    "pred_boxes": pred_boxes_i.unsqueeze(0),
+                    "logits": logits_i.unsqueeze(0),
+                },
+                [labels[i]],
+            )
+            r = torch.zeros_like(reserve, dtype=torch.bool)
+            match_res = match_res[0]
+            r[match_res[0]] = True
+            reserve = reserve | r
+            logits_i = logits_i[reserve]
+            pred_boxes_i = pred_boxes_i[reserve]
+            embed = embed[reserve]
+
+        positions.append(positions[-1] + logits_i.shape[0])
+        match_res = matcher(
+            {"pred_boxes": pred_boxes_i.unsqueeze(0), "logits": logits_i.unsqueeze(0)},
+            [labels[i]],
+        )
         label = labels[i]
         num_obj, _ = logits_i.shape
         pos = torch.zeros((num_obj, 5)).to(device)
@@ -662,10 +725,13 @@ def process(outputs, labels, empty=4, need_mask=False, nms = -1.0):
         else:
             pos[:, 0] /= 500.0
         pos[:, 1:5] = pred_boxes_i[:, 0:4]
-
-        logit = logits_i
+        if has_none:
+            logit = logits_i[:, :-1]
+            # logit = logits_i
+        else:
+            logit = logits_i
         # print(pos.shape, logit.shape, embed.shape)
-        
+
         input = torch.concat([pos, logit, embed], dim=1)
         ret.append(input)
 
@@ -710,6 +776,7 @@ def process(outputs, labels, empty=4, need_mask=False, nms = -1.0):
             "boxes": boxeses,
             "item_id": item_ids,
             "masks": mask,
+            "positions": positions,
         }
     return {
         "feature": ret,
@@ -717,6 +784,7 @@ def process(outputs, labels, empty=4, need_mask=False, nms = -1.0):
         "box_mask": box_masks,
         "boxes": boxeses,
         "item_id": item_ids,
+        "positions": positions,
     }
 
 
@@ -728,58 +796,73 @@ def get_iou(X):
     iou = iou.numpy()
     return iou
 
-def get_iou_numpy(X):
+
+def get_iou_numpy(X, block_size=1024):
     """
-    Pure numpy version of get_iou.
-    
-    Args:
-        X: numpy array of shape (N, 4) with boxes in center format (x, y, w, h)
-    
-    Returns:
-        iou: numpy array of shape (N, N) with pairwise IoU values
+    Sparse pairwise IoU for boxes in center format (x, y, w, h).
+
+    Returns a CSR matrix that stores only positive IoU entries in the upper triangle
+    plus the diagonal. This keeps the memory footprint low for sparse DBSCAN graphs.
     """
-    # Convert from center format (x, y, w, h) to corner format (x1, y1, x2, y2)
-    x, y, w, h = X[:, 0], X[:, 1], X[:, 2], X[:, 3]
-    x1 = x - w / 2
-    y1 = y - h / 2
-    x2 = x + w / 2
-    y2 = y + h / 2
-    
-    # Stack into corner format boxes: (x1, y1, x2, y2)
-    boxes = np.stack([x1, y1, x2, y2], axis=1)  # shape: (N, 4)
-    
-    # Compute pairwise IoU
-    N = boxes.shape[0]
-    iou = np.zeros((N, N), dtype=np.float32)
-    
-    # Get areas for each box
-    areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])  # shape: (N,)
-    
-    # Compute pairwise intersections and unions
-    # Expand dims for broadcasting: (N, 1, 4) and (1, N, 4)
-    boxes_i = boxes[:, np.newaxis, :]  # shape: (N, 1, 4)
-    boxes_j = boxes[np.newaxis, :, :]  # shape: (1, N, 4)
-    
-    # Compute intersection coordinates
-    x1_inter = np.maximum(boxes_i[:, :, 0], boxes_j[:, :, 0])  # shape: (N, N)
-    y1_inter = np.maximum(boxes_i[:, :, 1], boxes_j[:, :, 1])
-    x2_inter = np.minimum(boxes_i[:, :, 2], boxes_j[:, :, 2])
-    y2_inter = np.minimum(boxes_i[:, :, 3], boxes_j[:, :, 3])
-    
-    # Compute intersection area
-    w_inter = np.maximum(0, x2_inter - x1_inter)
-    h_inter = np.maximum(0, y2_inter - y1_inter)
-    inter_area = w_inter * h_inter  # shape: (N, N)
-    
-    # Compute union area
-    areas_i = areas[:, np.newaxis]  # shape: (N, 1)
-    areas_j = areas[np.newaxis, :]  # shape: (1, N)
-    union_area = areas_i + areas_j - inter_area  # shape: (N, N)
-    
-    # Compute IoU
-    iou = inter_area / (union_area + 1e-6)  # add small epsilon to avoid division by zero
-    
-    return iou
+    X = np.asarray(X, dtype=np.float32)
+    if X.ndim != 2 or X.shape[1] != 4:
+        raise ValueError("X must have shape (N, 4)")
+
+    n = X.shape[0]
+    if n == 0:
+        return csr_matrix((0, 0), dtype=np.float32)
+
+    x1 = X[:, 0] - X[:, 2] / 2.0
+    y1 = X[:, 1] - X[:, 3] / 2.0
+    x2 = X[:, 0] + X[:, 2] / 2.0
+    y2 = X[:, 1] + X[:, 3] / 2.0
+    boxes = np.stack([x1, y1, x2, y2], axis=1)
+
+    areas = np.maximum(0.0, (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1]))
+
+    rows = []
+    cols = []
+    data = []
+
+    for start in range(0, n, block_size):
+        end = min(start + block_size, n)
+        block = boxes[start:end]
+
+        inter_x1 = np.maximum(block[:, None, 0], boxes[None, :, 0])
+        inter_y1 = np.maximum(block[:, None, 1], boxes[None, :, 1])
+        inter_x2 = np.minimum(block[:, None, 2], boxes[None, :, 2])
+        inter_y2 = np.minimum(block[:, None, 3], boxes[None, :, 3])
+
+        inter_w = np.maximum(0.0, inter_x2 - inter_x1)
+        inter_h = np.maximum(0.0, inter_y2 - inter_y1)
+        inter_area = inter_w * inter_h
+
+        union = areas[start:end, None] + areas[None, :] - inter_area
+        union = np.maximum(union, 1e-8)
+        iou = inter_area / union
+
+        row_idx, col_idx = np.nonzero(iou > 0.0)
+        if len(row_idx) == 0:
+            continue
+
+        rows.append(row_idx + start)
+        cols.append(col_idx)
+        data.append(iou[row_idx, col_idx].astype(np.float32, copy=False))
+
+    if len(rows) == 0:
+        return csr_matrix((n, n), dtype=np.float32)
+
+    rows = np.concatenate(rows)
+    cols = np.concatenate(cols)
+    data = np.concatenate(data)
+
+    keep = rows <= cols
+    rows = rows[keep]
+    cols = cols[keep]
+    data = data[keep]
+
+    return csr_matrix((data, (rows, cols)), shape=(n, n), dtype=np.float32)
+
 
 # def get_neighbors(
 #     X, z_thres1=0.03, z_thres2=0.5, iou_thres=0.4, num_classes=5, obj_thres=0.2
@@ -817,7 +900,7 @@ def get_iou_numpy(X):
 def get_neighbors(
     X,
     z_thres1=0.001,
-    z_thres2=0.5,
+    # z_thres2=0.5,
     iou_thres=0.4,
     num_classes=4,
     obj_thres=0.2,
@@ -865,9 +948,9 @@ def get_neighbors(
 
     zposx = X[:, 0][x1]
     zposy = X[:, 0][y1]
-    need = (zposx != zposy) & (torch.abs(zposx - zposy) < z_thres2)
-    x1 = x1[need]
-    y1 = y1[need]
+    # need = (zposx != zposy) & (torch.abs(zposx - zposy) < z_thres2)
+    # x1 = x1[need]
+    # y1 = y1[need]
     # print(len(x), len(y), len(x1), len(y1))
     x1 = torch.cat([x, x1])
     y1 = torch.cat([y, y1])
@@ -912,10 +995,10 @@ def get_neighbors(
 def convertStage2Dataset(
     retdict,
     z_thres1=0.0001,
-    z_thres2=0.1,
+    # z_thres2=0.1,
     iou_thres=0.4,
     num_classes=4,
-    obj_thres=0.2,
+    obj_thres=0.1,
     max_edges=None,
 ):
     X = retdict["feature"]
@@ -924,7 +1007,7 @@ def convertStage2Dataset(
     xs, ys, edge_type = get_neighbors(
         X.clone().detach(),
         z_thres1=z_thres1,
-        z_thres2=z_thres2,
+        # z_thres2=z_thres2,
         iou_thres=iou_thres,
         obj_thres=obj_thres,
         num_classes=num_classes,
@@ -1239,9 +1322,18 @@ def getModel(configs):
 
     if "weight_decay" not in configs["training"]:
         configs["training"]["weight_decay"] = 0.0
-        
+
     if "nms" not in configs["model"]:
         configs["model"]["nms"] = -1.0
+
+    if "iou_thres" not in configs["model"]:
+        configs["model"]["iou_thres"] = 0.4
+
+    if "graph_thres" not in configs["model"]:
+        configs["model"]["graph_thres"] = -1.0
+
+    if "z_max" not in configs["model"]:
+        configs["model"]["z_max"] = 500
 
     model = modules.DetrModel(
         configs["model"]["stage"],
@@ -1267,6 +1359,9 @@ def getModel(configs):
         ],
         box_head=configs["model"]["box_head"],
         nms=configs["model"]["nms"],
+        iou_thres=configs["model"]["iou_thres"],
+        graph_thres=configs["model"]["graph_thres"],
+        zpos_max=configs["model"]["z_max"],
     )
 
     if "load" in configs["model"] and configs["model"]["load"] is not None:
@@ -1607,5 +1702,757 @@ def pickAndLoadBest(model, path):
                     loss_best = loss
                     best = i
     a = torch.load(os.path.join(path, best), map_location="cpu")["state_dict"]
+
+    # Check parameters and remove incompatible ones
+    p = list(model.state_dict().keys())
+    need_del = []
+    for i in a:
+        if i not in p or a[i].shape != model.state_dict()[i].shape:
+            need_del.append(i)
+    for i in need_del:
+        del a[i]
+    if need_del:
+        print("incompatible parameters removed:", need_del)
+
     model.load_state_dict(a, strict=False)
     return model
+
+
+def sweep_filter_points_by_distance(
+    xyz,
+    scores,
+    threshold,
+    # tree_rebuild_every=256,
+    return_index=False,
+):
+    """
+    Score-priority suppression using Euclidean distance.
+
+    Procedure:
+    1) Build a KDTree on all points.
+    2) Pop points from lowest score to highest score.
+    3) For each popped point, find its nearest remaining point.
+    4) If the nearest distance is lower than `threshold`, label this point as dropped.
+
+    Args:
+        xyz: array-like of shape (N, 3)
+        scores: array-like of shape (N,)
+        threshold: float distance threshold
+        use_kdtree: kept for backward compatibility
+        # tree_rebuild_every: kept for backward compatibility
+        return_index: bool, also return indices (w.r.t. original input order)
+    """
+    xyz = np.asarray(xyz, dtype=float)
+    scores = np.asarray(scores, dtype=float)
+
+    if xyz.ndim != 2 or xyz.shape[1] != 3:
+        raise ValueError("xyz must have shape (N, 3)")
+    if scores.ndim != 1 or len(scores) != len(xyz):
+        raise ValueError("scores must have shape (N,) and match xyz length")
+    if threshold < 0:
+        raise ValueError("threshold must be non-negative")
+    # if tree_rebuild_every < 1:
+    #     raise ValueError("tree_rebuild_every must be >= 1")
+
+    if len(xyz) == 0:
+        if return_index:
+            return xyz.copy(), scores.copy(), np.empty((0,), dtype=int)
+        return xyz.copy(), scores.copy()
+
+    from scipy.spatial import cKDTree
+
+    # Pop from low score to high score.
+    order = np.argsort(scores, kind="stable")
+    tree = cKDTree(xyz)
+    active = np.ones(len(xyz), dtype=bool)
+    dropped = np.zeros(len(xyz), dtype=bool)
+
+    for idx in order:
+        # Pop out current point from remaining set before nearest-neighbor check.
+        active[idx] = False
+
+        if not np.any(active):
+            continue
+
+        # Find the closest currently active point using the tree built from all points.
+        nearest_dist = np.inf
+        k = min(2, len(xyz))
+        while True:
+            dist, nbr = tree.query(xyz[idx], k=k)
+            dist = np.atleast_1d(dist)
+            nbr = np.atleast_1d(nbr).astype(int)
+
+            valid = (nbr >= 0) & active[nbr]
+            if np.any(valid):
+                nearest_dist = float(np.min(dist[valid]))
+                break
+
+            if k >= len(xyz):
+                break
+            k = min(len(xyz), max(k + 1, k * 2))
+
+        if nearest_dist < float(threshold):
+            dropped[idx] = True
+
+    keep_mask = ~dropped
+    kept_xyz = xyz[keep_mask]
+    kept_scores = scores[keep_mask]
+
+    if return_index:
+        kept_input_idx = np.where(keep_mask)[0]
+        return kept_xyz, kept_scores, kept_input_idx
+    return kept_xyz, kept_scores
+
+
+def sweep_to_find_prediction_centers(
+    tomogram_name,
+    subdf_csv_path,
+    prob_threshold,
+    tomogram_size_x,
+    tomogram_size_y,
+    sweep_threshold,
+    score_column="ribosome",
+    coord_columns=("z", "y", "x"),
+    tomogram_size_z=500,
+    remove_boundry_points=10,
+):
+    """
+    Build a prediction-center dataframe for one tomogram by:
+    1) loading model raw predictions from csv,
+    2) filtering by score threshold,
+    3) scaling x/y into tomogram coordinates,
+    4) applying distance sweep suppression.
+
+    Returns a dataframe with columns:
+    ["z", "y", "x", "tomogram", "label", "prediction_score"]
+    """
+    df = pd.read_csv(subdf_csv_path)
+
+    if score_column not in df.columns:
+        raise KeyError(f"Missing score column: {score_column}")
+
+    for col in coord_columns:
+        if col not in df.columns:
+            raise KeyError(f"Missing coordinate column: {col}")
+
+    df = df[df[score_column] > prob_threshold].copy()
+    if df.empty:
+        return pd.DataFrame(
+            columns=["z", "y", "x", "tomogram", "label", "prediction_score"]
+        )
+
+    if "x" in coord_columns:
+        df["x"] = df["x"] * tomogram_size_x
+    if "y" in coord_columns:
+        df["y"] = df["y"] * tomogram_size_y
+
+    score = df[score_column].to_numpy()
+    predict_center = df[list(coord_columns)].to_numpy()
+    predict_center, score = sweep_filter_points_by_distance(
+        predict_center,
+        score,
+        threshold=sweep_threshold,
+    )
+
+    result_df = pd.DataFrame(predict_center, columns=list(coord_columns))
+    result_df["tomogram"] = tomogram_name
+    # a dummy for preparing dataset
+    result_df["label"] = -1
+    if remove_boundry_points > 0:
+        result_df = result_df[
+            (result_df["z"] >= remove_boundry_points)
+            & (result_df["z"] < (tomogram_size_z - remove_boundry_points))
+        ]
+    return result_df
+
+
+def sweep_filter_points_by_distance_bug_version(
+    xyz,
+    scores,
+    threshold,
+    use_kdtree=True,
+    tree_rebuild_every=256,
+    return_index=False,
+):
+    """
+    look what gpt writes for me, a bug version of sweep_filter_points_by_distance
+    I just wonder why this sweep always lower performance.
+    I must record this function here for anyone who read my code.
+    Do not simply trust AI, it may fool you!
+
+    Greedy sweep from low to high coordinates (lexicographic z, y, x).
+    A point is removed if it is closer than `threshold` to any previously kept point.
+
+    Args:
+        xyz: array-like of shape (N, 3)
+        scores: array-like of shape (N,)
+        threshold: float distance threshold
+        use_kdtree: bool, use KDTree for nearest-neighbor checks
+        tree_rebuild_every: int, rebuild cadence for KDTree mode
+        return_index: bool, also return indices (w.r.t. original input order)
+    """
+    xyz = np.asarray(xyz, dtype=float)
+    scores = np.asarray(scores, dtype=float)
+
+    if xyz.ndim != 2 or xyz.shape[1] != 3:
+        raise ValueError("xyz must have shape (N, 3)")
+    if scores.ndim != 1 or len(scores) != len(xyz):
+        raise ValueError("scores must have shape (N,) and match xyz length")
+    if threshold < 0:
+        raise ValueError("threshold must be non-negative")
+    if tree_rebuild_every < 1:
+        raise ValueError("tree_rebuild_every must be >= 1")
+
+    if len(xyz) == 0:
+        if return_index:
+            return xyz.copy(), scores.copy(), np.empty((0,), dtype=int)
+        return xyz.copy(), scores.copy()
+
+    # Low -> high sweep by z, then y, then x
+    order = np.lexsort((xyz[:, 2], xyz[:, 1], xyz[:, 0]))
+    xyz_sorted = xyz[order]
+    scores_sorted = scores[order]
+
+    kept_points = []
+    kept_scores = []
+    kept_sorted_idx = []
+    th = float(threshold)
+    th2 = th * th
+
+    if not use_kdtree:
+        for local_i, (p, s) in enumerate(zip(xyz_sorted, scores_sorted)):
+            if len(kept_points) > 0:
+                prev = np.asarray(kept_points)
+                d2 = np.sum((prev - p) ** 2, axis=1)
+                if np.any(d2 < th2):
+                    # Pop out current point (do not keep).
+                    continue
+
+            kept_points.append(p)
+            kept_scores.append(s)
+            kept_sorted_idx.append(local_i)
+    else:
+        from scipy.spatial import cKDTree
+
+        committed_points = []
+        committed_count = 0
+        tree = None
+        recent_points = []
+        recent_local_idx = []
+
+        for local_i, (p, s) in enumerate(zip(xyz_sorted, scores_sorted)):
+            too_close = False
+
+            # Query nearest in KDTree (committed points).
+            if tree is not None:
+                nearest_dist, _ = tree.query(p, k=1)
+                if nearest_dist < th:
+                    too_close = True
+
+            # Also check recent points not yet included in KDTree.
+            if (not too_close) and len(recent_points) > 0:
+                rp = np.asarray(recent_points)
+                d2 = np.sum((rp - p) ** 2, axis=1)
+                if np.any(d2 < th2):
+                    too_close = True
+
+            if too_close:
+                # Pop out current point (do not keep).
+                continue
+
+            kept_points.append(p)
+            kept_scores.append(s)
+            kept_sorted_idx.append(local_i)
+
+            recent_points.append(p)
+            recent_local_idx.append(local_i)
+
+            # Rebuild tree periodically to include recent accepted points.
+            if len(recent_points) >= tree_rebuild_every:
+                committed_points.extend(recent_points)
+                committed_count += len(recent_points)
+                tree = cKDTree(np.asarray(committed_points))
+                recent_points = []
+                recent_local_idx = []
+
+        # Final rebuild not required for correctness at this point.
+
+    kept_xyz = np.asarray(kept_points, dtype=float)
+    kept_scores = np.asarray(kept_scores, dtype=float)
+
+    if return_index:
+        kept_input_idx = order[np.asarray(kept_sorted_idx, dtype=int)]
+        return kept_xyz, kept_scores, kept_input_idx
+    return kept_xyz, kept_scores
+
+
+def sample_empty_points_for_tomogram(
+    pos_zyx, shape_zyx, n_samples, min_dist=30.0, max_trials=200000, seed=42
+):
+    """Sample empty points in ZYX format, far from known centers in ZYX."""
+    np.random.seed(seed)
+    D, H, W = shape_zyx
+    if n_samples <= 0:
+        return np.zeros((0, 3), dtype=np.int32)
+
+    pos_zyx = np.asarray(pos_zyx, dtype=np.float32)
+    min_dist2 = float(min_dist * min_dist)
+    picked = []
+    trials = 0
+
+    while len(picked) < n_samples and trials < max_trials:
+        batch_n = min(5000, max((n_samples - len(picked)) * 20, 512))
+        cand = np.stack(
+            [
+                np.random.randint(0, D, size=batch_n),
+                np.random.randint(0, H, size=batch_n),
+                np.random.randint(0, W, size=batch_n),
+            ],
+            axis=1,
+        ).astype(
+            np.float32
+        )  # (z, y, x)
+
+        if pos_zyx.shape[0] > 0:
+            diff = cand[:, None, :] - pos_zyx[None, :, :]
+            d2 = np.sum(diff * diff, axis=2)
+            keep = np.all(d2 > min_dist2, axis=1)
+            cand = cand[keep]
+
+        need = n_samples - len(picked)
+        if cand.shape[0] > 0:
+            picked.extend(cand[:need].astype(np.int32).tolist())
+
+        trials += batch_n
+
+    if len(picked) < n_samples:
+        print(f"warning: only sampled {len(picked)} / {n_samples} empty points")
+
+    return np.asarray(picked[:n_samples], dtype=np.int32)
+
+
+def nearest_label_distance_vector(labels, predict_center):
+    """Return nearest distance from each predicted point to any label point."""
+    from scipy.spatial import cKDTree
+
+    labels = np.asarray(labels)
+    predict_center = np.asarray(predict_center)
+
+    if predict_center.size == 0:
+        return np.array([], dtype=float)
+    if labels.size == 0:
+        return np.full(predict_center.shape[0], np.inf, dtype=float)
+
+    tree = cKDTree(labels)
+    distances, _ = tree.query(predict_center, k=1)
+    return distances
+
+
+def build_balanced_negative_points_zyx(
+    labels_zyx,
+    predict_center_zyx,
+    negative_distance,
+    shape_zyx,
+    negative_to_positive_ratio=2,
+    seed=42,
+):
+    """Build balanced negative points in ZYX format.
+
+    Rules:
+    1) Start from predicted points farther than `negative_distance` from labels.
+    2) If negatives > ratio * positives, downsample negatives to ratio * positives.
+    3) If negatives < positives, sample empty points to reach positives.
+    """
+    labels_zyx = np.asarray(labels_zyx)
+    predict_center_zyx = np.asarray(predict_center_zyx)
+
+    closest_dist = nearest_label_distance_vector(labels_zyx, predict_center_zyx)
+    negative_mask = closest_dist > float(negative_distance)
+    need = np.where(negative_mask)[0]
+
+    pos_cnt = len(labels_zyx)
+    neg_cnt = len(need)
+    max_neg = int(negative_to_positive_ratio * pos_cnt)
+
+    if neg_cnt > max_neg:
+        if max_neg > 0:
+            rng = np.random.default_rng(seed)
+            need = rng.choice(need, size=max_neg, replace=False)
+        else:
+            need = np.array([], dtype=int)
+        neg_points_zyx = predict_center_zyx[need]
+    elif neg_cnt < pos_cnt:
+        add_n = pos_cnt - neg_cnt
+        sampled_zyx = sample_empty_points_for_tomogram(
+            pos_zyx=(
+                labels_zyx
+                if len(labels_zyx) > 0
+                else np.zeros((0, 3), dtype=np.float32)
+            ),
+            shape_zyx=shape_zyx,
+            n_samples=add_n,
+            min_dist=negative_distance,
+            seed=seed,
+        )
+        sampled_zyx = sampled_zyx.astype(predict_center_zyx.dtype, copy=False)
+        if len(need) > 0:
+            neg_points_zyx = np.concatenate(
+                [predict_center_zyx[need], sampled_zyx], axis=0
+            )
+        else:
+            neg_points_zyx = sampled_zyx
+    else:
+        neg_points_zyx = predict_center_zyx[need]
+
+    return neg_points_zyx, closest_dist
+
+
+def center_logits_to_crop_coords(center_logits, crop_size, method="weighted_average"):
+    """Convert center logits to continuous crop coordinates in (z, y, x)."""
+    b, _, d, h, w = center_logits.shape
+    flat_logits = center_logits.flatten(1)
+
+    if method == "argmax":
+        pred_idx = flat_logits.argmax(dim=1)
+        pred_z = pred_idx // (h * w)
+        pred_y = (pred_idx % (h * w)) // w
+        pred_x = pred_idx % w
+        pred_grid = torch.stack([pred_z, pred_y, pred_x], dim=1).float()
+    elif method == "weighted_average":
+        probs = torch.softmax(flat_logits, dim=1)
+        zz, yy, xx = torch.meshgrid(
+            torch.arange(d, device=center_logits.device, dtype=probs.dtype),
+            torch.arange(h, device=center_logits.device, dtype=probs.dtype),
+            torch.arange(w, device=center_logits.device, dtype=probs.dtype),
+            indexing="ij",
+        )
+        grid = torch.stack([zz, yy, xx], dim=-1).reshape(1, d * h * w, 3)
+        pred_grid = (probs.unsqueeze(-1) * grid).sum(dim=1)
+    else:
+        raise ValueError("method must be 'argmax' or 'weighted_average'")
+
+    scale = torch.tensor(
+        [
+            (crop_size - 1) / max(d - 1, 1),
+            (crop_size - 1) / max(h - 1, 1),
+            (crop_size - 1) / max(w - 1, 1),
+        ],
+        device=center_logits.device,
+        dtype=pred_grid.dtype,
+    )
+    return pred_grid * scale
+
+
+def test_predict_df_with_revised_centers(
+    df_predict,
+    dataset,
+    model,
+    batch_size=32,
+    label_names=None,
+    center_method="weighted_average",
+):
+    """
+    Run inference on df_predict candidates and return a table with predictions
+    and revised centers.
+
+    Returns a copy of df_predict with:
+      - prediction, prediction_score
+      - revised_z, revised_y, revised_x
+    """
+    import copy
+
+    from torch.utils.data import DataLoader
+    from tqdm.auto import tqdm
+
+    if not isinstance(df_predict, pd.DataFrame) or len(df_predict) == 0:
+        raise ValueError("df_predict must be a non-empty DataFrame")
+    if not isinstance(model, torch.nn.Module):
+        raise ValueError("model must be a torch.nn.Module instance")
+    if not hasattr(dataset, "loaded_volumes") or not hasattr(dataset, "crop_size"):
+        raise ValueError("dataset must provide loaded_volumes and crop_size")
+
+    required_cols = {"z", "y", "x"}
+    if not required_cols.issubset(set(df_predict.columns)):
+        raise ValueError(f"df_predict must contain columns: {required_cols}")
+
+    eval_df = df_predict.copy().reset_index(drop=True)
+    dataset_df = getattr(dataset, "df", pd.DataFrame()).reset_index(drop=True).copy()
+
+    if "tomogram" not in eval_df.columns:
+        if "tomogram" in dataset_df.columns and len(dataset_df) == len(eval_df):
+            eval_df["tomogram"] = dataset_df["tomogram"].to_numpy()
+        elif len(dataset.loaded_volumes) == 1:
+            eval_df["tomogram"] = next(iter(dataset.loaded_volumes))
+        else:
+            raise ValueError(
+                "df_predict must contain a tomogram column when dataset has multiple loaded volumes"
+            )
+
+    infer_df = eval_df.copy()
+    if "label" not in infer_df.columns:
+        infer_df["label"] = 0
+
+    infer_dataset = copy.copy(dataset)
+    infer_dataset.df = infer_df.reset_index(drop=True)
+    if hasattr(infer_dataset, "if_augmentation"):
+        infer_dataset.if_augmentation = False
+    if hasattr(infer_dataset, "r"):
+        infer_dataset.r = 0
+
+    infer_loader = DataLoader(
+        infer_dataset, batch_size=batch_size, shuffle=False, num_workers=0
+    )
+    total_batches = len(infer_loader)
+
+    print(
+        f"Preparing inference for {len(infer_df)} candidates across {infer_df['tomogram'].nunique()} tomograms"
+    )
+    print(
+        f"Using batch_size={batch_size}, total_batches={total_batches}, center_method={center_method}"
+    )
+
+    device = next(model.parameters()).device
+    model = model.to(device).eval()
+    print(f"Running model on device: {device}")
+
+    all_predictions = []
+    all_prediction_labels = []
+    all_pred_crop_centers = []
+    with torch.no_grad():
+        for batch in tqdm(
+            infer_loader, total=total_batches, desc="Predicting", leave=False
+        ):
+            x = batch[0] if isinstance(batch, (tuple, list)) else batch
+            x = x.to(device)
+            logits, center_ret = model(x, return_center=True)
+
+            if logits.ndim == 1 or logits.shape[1] == 1:
+                positive_scores = torch.sigmoid(logits.reshape(-1))
+                prediction_labels = (positive_scores >= 0.5).long()
+                predictions = positive_scores
+            else:
+                probs = torch.softmax(logits, dim=1)
+                # print(probs.shape)
+                prediction_labels = probs.argmax(dim=1)
+                if probs.shape[1] == 2:
+                    predictions = probs[:, 1]
+                else:
+                    predictions = probs[:, 1:]
+            print(center_ret["center_logits"].shape)
+            # print(torch.argmax(center_ret["center_logits"], dim=1))
+            pred_crop_centers = (
+                center_logits_to_crop_coords(
+                    center_ret["center_logits"],
+                    crop_size=infer_dataset.crop_size,
+                    method=center_method,
+                )
+                .detach()
+                .cpu()
+                .numpy()
+            )
+
+            all_predictions.append(predictions.detach().cpu().numpy())
+            all_prediction_labels.append(prediction_labels.detach().cpu().numpy())
+            all_pred_crop_centers.append(pred_crop_centers)
+
+    predictions = np.concatenate(all_predictions, axis=0)
+    # print(predictions.shape)
+    prediction_labels = np.concatenate(all_prediction_labels, axis=0)
+    pred_crop_centers = np.concatenate(all_pred_crop_centers, axis=0)
+    print("Revising centers from predicted crop coordinates")
+
+    centers_int = infer_df[["z", "y", "x"]].astype(int).to_numpy()
+    half = infer_dataset.crop_size // 2
+    origin = np.maximum(centers_int - half, 0)
+    revised_centers = np.empty_like(pred_crop_centers, dtype=float)
+    for row_idx, tomo_name in enumerate(infer_df["tomogram"].astype(str).to_numpy()):
+        upper = np.asarray(infer_dataset.loaded_volumes[tomo_name].shape) - 1
+        revised_centers[row_idx] = np.clip(
+            origin[row_idx] + pred_crop_centers[row_idx], 0, upper
+        )
+
+    out_df = eval_df.copy()
+    out_df["prediction"] = prediction_labels
+    if label_names is not None and len(label_names) > 0:
+        for i, name in enumerate(label_names):
+            out_df[f"score_{name}"] = (
+                predictions[:, i] if predictions.ndim > 1 else predictions
+            )
+    else:
+        out_df["prediction_score"] = predictions
+    out_df[["revised_z", "revised_y", "revised_x"]] = revised_centers
+    print(f"Finished inference. Added prediction columns for {len(out_df)} rows.")
+
+    return out_df
+
+
+def best_f1_threshold(y_true, y_score, recall_amendment=1.0):
+    """
+    Given binary labels and continuous scores, find the threshold that maximizes F1.
+    Returns: (best_threshold, precision_at_best, recall_at_best, f1_at_best)
+    """
+    y_true = np.asarray(y_true).astype(int).ravel()
+    y_score = np.asarray(y_score).astype(float).ravel()
+
+    if y_true.shape[0] != y_score.shape[0]:
+        raise ValueError(
+            f"Mismatched lengths: y_true={y_true.shape}, y_score={y_score.shape}"
+        )
+
+    # Drop NaN scores if any
+    mask = ~np.isnan(y_score)
+    y_true = y_true[mask]
+    y_score = y_score[mask]
+
+    if y_true.size == 0:
+        raise ValueError("Empty y_true/y_score after filtering")
+
+    # Handle trivial single-class cases
+    if np.all(y_true == 0):
+        thr = float(np.max(y_score) + 1e-12)  # predict all negatives
+        precision = 1.0
+        recall = 0.0
+        f1 = 0.0
+        return thr, precision, recall, f1
+    if np.all(y_true == 1):
+        thr = float(np.min(y_score) - 1e-12)  # predict all positives
+        precision = 1.0
+        recall = 1.0
+        f1 = 1.0
+        return thr, precision, recall, f1
+
+    # Use PR curve thresholds (where predictions change)
+    precision, recall, thresholds = precision_recall_curve(y_true, y_score)
+    recall = recall * recall_amendment
+    # precision/recall have length N+1, thresholds length N; align on thresholds with precision[1:], recall[1:]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        f1 = 2 * precision[1:] * recall[1:] / (precision[1:] + recall[1:] + 1e-12)
+
+    if f1.size == 0:
+        # Fallback: sweep unique score values
+        uniq = np.unique(y_score)
+        best = (-1.0, None)
+        for thr in uniq:
+            pred = (y_score >= thr).astype(int)
+            tp = np.sum((pred == 1) & (y_true == 1))
+            fp = np.sum((pred == 1) & (y_true == 0))
+            fn = np.sum((pred == 0) & (y_true == 1))
+            prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            rec = rec * recall_amendment
+            f1v = 2 * prec * rec / (prec + rec + 1e-12)
+            if f1v > best[0]:
+                best = (f1v, (thr, prec, rec))
+        if best[1] is None:
+            return float("nan"), float("nan"), float("nan"), float("nan")
+        thr, prec, rec = best[1]
+        return float(thr), float(prec), float(rec), float(best[0])
+
+    idx = int(np.argmax(f1))
+    best_thr = float(thresholds[idx])
+
+    # Compute P/R/F1 at the chosen threshold
+    pred = (y_score >= best_thr).astype(int)
+    tp = int(np.sum((pred == 1) & (y_true == 1)))
+    fp = int(np.sum((pred == 1) & (y_true == 0)))
+    fn = int(np.sum((pred == 0) & (y_true == 1)))
+    precision_at = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall_at = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    recall_at = recall_at * recall_amendment
+    f1_at = 2 * precision_at * recall_at / (precision_at + recall_at + 1e-12)
+
+    print(
+        {
+            "threshold": best_thr,
+            "precision": float(precision_at),
+            "recall": float(recall_at),
+            "f1": float(f1_at),
+        }
+    )
+    return best_thr, float(precision_at), float(recall_at), float(f1_at)
+
+
+def match_points(pred_points, target_points, scores, threshold):
+    """
+    Match predicted 3D points to target 3D points.
+
+    Priority:
+    1. Maximize the number of matches within distance threshold.
+    2. Among those, prefer predicted points with higher scores.
+    3. As a tie-breaker, prefer shorter distances.
+
+    Parameters
+    ----------
+    pred_points : array-like, shape (N, 3)
+    target_points : array-like, shape (M, 3)
+    scores : array-like, shape (N,)
+        Score for each predicted point.
+    threshold : float
+        Maximum distance allowed for a valid match.
+
+    Returns
+    -------
+    matches : list of dict
+        Each dict contains pred_index, target_index, distance, score.
+    """
+
+    pred_points = np.asarray(pred_points, dtype=float)
+    target_points = np.asarray(target_points, dtype=float)
+    scores = np.asarray(scores, dtype=float)
+
+    n_pred = len(pred_points)
+    n_target = len(target_points)
+
+    if n_pred == 0 or n_target == 0:
+        return [], []
+
+    # Pairwise Euclidean distances: shape (n_pred, n_target)
+    diff = pred_points[:, None, :] - target_points[None, :, :]
+    dist = np.sqrt(np.sum(diff**2, axis=-1))
+
+    # Normalize scores so score priority cannot override match count
+    score_min = scores.min()
+    score_range = scores.max() - score_min
+    if score_range == 0:
+        norm_scores = np.zeros_like(scores)
+    else:
+        norm_scores = (scores - score_min) / score_range
+
+    # Build square reward matrix with dummy rows/columns for unmatched points
+    size = n_pred + n_target
+    reward = np.zeros((size, size))
+
+    big_match_reward = n_pred + n_target + 1
+    invalid_reward = -1e9
+
+    # Valid predicted-target matches get high reward
+    for i in range(n_pred):
+        for j in range(n_target):
+            if dist[i, j] <= threshold:
+                reward[i, j] = (
+                    big_match_reward
+                    + norm_scores[i]
+                    - 1e-6 * dist[i, j]  # tiny distance tie-breaker
+                )
+            else:
+                reward[i, j] = invalid_reward
+
+    # Hungarian algorithm maximizes total reward
+    row_ind, col_ind = linear_sum_assignment(reward, maximize=True)
+
+    matches = []
+    all_matched_id = []
+    for r, c in zip(row_ind, col_ind):
+        if r < n_pred and c < n_target:
+            if dist[r, c] <= threshold:
+                all_matched_id.append(r)
+                matches.append(
+                    {
+                        "pred_index": r,
+                        "target_index": c,
+                        "distance": dist[r, c],
+                        "score": scores[r],
+                    }
+                )
+
+    return matches, all_matched_id
