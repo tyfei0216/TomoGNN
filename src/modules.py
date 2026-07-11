@@ -202,10 +202,6 @@ def total_variation_loss(mask):
     return loss
 
 
-# def smooth_l1_loss(pred_box, target_box):
-#     return F.smooth_l1_loss(pred_box, target_box)
-
-
 def single_chunk_noise_loss(pred_mask, target_mask, boxes, eps=0.02, warn=False):
     """Penalize predicted mask activation outside predicted bounding boxes.
 
@@ -286,13 +282,13 @@ class CompositeSegBBoxLoss(nn.Module):
         loss_tv = total_variation_loss(torch.sigmoid(pred_mask))
         loss_noise = single_chunk_noise_loss(
             pred_mask, target_mask, pred_box, warn=self.warn
-        )  # not added now
+        )
 
         total_loss = (
             self.lambda_dice * loss_seg
             + self.lambda_bce * loss_bce
             + self.lambda_tv * loss_tv
-            + self.lambda_noise * loss_noise  # optional
+            + self.lambda_noise * loss_noise
         )
         return total_loss
 
@@ -2111,130 +2107,6 @@ class ParticleID3DNet_Binary(L.LightningModule):
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=1e-4, weight_decay=1e-5)
-
-
-# class ParticleID3DNet_Binary(L.LightningModule):
-
-#     def __init__(self, num_classes=1, regression=False, small=False):
-#         super().__init__()
-#         self.save_hyperparameters()
-
-#         # 3D convolutional backbone
-#         self.conv1 = nn.Conv3d(1, 16, kernel_size=5, padding=2)
-#         self.bn1 = nn.BatchNorm3d(16)
-#         self.conv1_1 = nn.Conv3d(16, 16, kernel_size=5, padding=2)
-
-#         self.conv2 = nn.Conv3d(16, 32, kernel_size=5, padding=2)
-#         self.bn2 = nn.BatchNorm3d(32)
-#         self.conv2_1 = nn.Conv3d(32, 32, kernel_size=5, padding=2)
-
-#         self.conv3 = nn.Conv3d(32, 64, kernel_size=5, padding=2)
-#         self.bn3 = nn.BatchNorm3d(64)
-#         self.conv3_1 = nn.Conv3d(64, 64, kernel_size=5, padding=2)
-
-#         self.pool = nn.MaxPool3d(2)
-
-#         if not small:
-#             # After 3 poolings: 65 -> 32 -> 16 -> 8
-#             self.fc1 = nn.Linear(64 * 8 * 8 * 8, 128)
-#         else:
-
-#             self.fc1 = nn.Linear(64 * 5 * 5 * 5, 128)
-
-#         self.num_classes = num_classes
-#         self.regression = regression
-#         if regression:
-#             self.fc2 = nn.Linear(128, num_classes)  # output dim = regression dim
-#             self.criterion = nn.MSELoss()
-#         elif num_classes == 1:
-#             self.fc2 = nn.Linear(128, 1)
-#             self.criterion = nn.BCEWithLogitsLoss()
-#         else:
-#             self.fc2 = nn.Linear(128, num_classes)
-#             self.criterion = nn.CrossEntropyLoss()
-
-#         self.training_step_outputs = []
-#         self.val_step_outputs = []
-
-#     def forward(self, x):
-#         x = self.pool(F.relu(self.bn1(self.conv1(x))))
-#         x = F.relu(self.conv1_1(x))
-#         x = self.pool(F.relu(self.bn2(self.conv2(x))))
-#         x = F.relu(self.conv2_1(x))
-#         x = self.pool(F.relu(self.bn3(self.conv3(x))))
-#         x = F.relu(self.conv3_1(x))
-#         x = torch.flatten(x, start_dim=1)
-#         x = F.relu(self.fc1(x))
-#         out = self.fc2(x)
-#         if self.regression:
-#             return out  # shape (B, num_regression)
-#         elif self.num_classes == 1:
-#             return out.squeeze(1)  # (B,)
-#         else:
-#             return out  # (B, num_classes)
-
-#     def shared_step(self, batch, stage, l):
-#         x, y = batch
-#         logits = self(x)
-#         if self.regression:
-#             # y shape: (B, num_regression)
-#             loss = self.criterion(logits, y)
-#             l.append({"y": y.cpu().numpy(), "pre": logits.detach().cpu().numpy()})
-#             return loss
-#         elif self.num_classes == 1:
-#             # Binary classification
-#             loss = self.criterion(logits, y.float())
-#             preds = torch.sigmoid(logits)
-#             predicted_classes = (preds > 0.5).float()
-#             acc = (predicted_classes == y).float().mean()
-#             l.append({"y": y.cpu().numpy(), "pre": preds.detach().cpu().numpy()})
-#             return loss
-#         else:
-#             # Multiclass classification
-#             loss = self.criterion(logits, y.long())
-#             preds = torch.softmax(logits, dim=1)
-#             predicted_classes = torch.argmax(preds, dim=1)
-#             acc = (predicted_classes == y).float().mean()
-#             l.append({"y": y.cpu().numpy(), "pre": preds.detach().cpu().numpy()})
-#             return loss
-
-#     def training_step(self, batch, batch_idx):
-#         return self.shared_step(batch, "train", self.training_step_outputs)
-
-#     def validation_step(self, batch, batch_idx):
-#         self.shared_step(batch, "val", self.val_step_outputs)
-
-#     def on_train_epoch_end(self):
-#         self.training_step_outputs.clear()
-
-#     def on_validation_epoch_end(self):
-#         preds = np.concatenate([x["pre"] for x in self.val_step_outputs], axis=0)
-#         trues = np.concatenate([x["y"] for x in self.val_step_outputs], axis=0)
-#         if self.regression:
-#             # For regression, print MSE
-#             mse = np.mean((preds - trues) ** 2)
-#             print("val_mse", mse)
-#         elif self.num_classes == 1:
-#             from sklearn.metrics import auc, precision_recall_curve, roc_auc_score
-
-#             precision, recall, thresholds = precision_recall_curve(trues, preds)
-#             aupr = auc(recall, precision)
-#             auroc = roc_auc_score(trues, preds)
-#             print("val_aupr", aupr, "val_auroc", auroc)
-#             print("logging")
-#             self.log_dict({"val_auroc": auroc, "val_aupr": aupr})
-#             # self.log("val_auroc", auroc)
-#             # self.log("val_aupr", aupr)
-#         else:
-#             from sklearn.metrics import accuracy_score, log_loss
-
-#             acc = accuracy_score(trues, np.argmax(preds, axis=1))
-#             ce = log_loss(trues, preds)
-#             print("val_acc", acc, "val_ce", ce)
-#         self.val_step_outputs.clear()
-
-#     def configure_optimizers(self):
-#         return torch.optim.Adam(self.parameters(), lr=1e-4, weight_decay=1e-5)
 
 
 class Particle3DNet(L.LightningModule):
