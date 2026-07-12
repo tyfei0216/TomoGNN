@@ -74,7 +74,7 @@ def run() -> None:
 
     Process:
     1. Load experiment configuration and print a readable summary.
-    2. Ensure stage output directories exist (`stage1`, `stage2`).
+    2. Ensure stage output directories exist (`stage2`, `stage3`).
     3. Seed all frameworks using `configs["seed"]`.
     4. Build the model via `utils.getModel(configs)` with stage-1 overrides.
     5. Train Stage 1 if `configs["training"]["epochs"][0] > 0`.
@@ -102,10 +102,9 @@ def run() -> None:
     print("using devices ", args.devices)
     print("using strategy ", args.strategy)
     print("--------")
-    if not os.path.exists(os.path.join(args.path, "stage1")):
-        os.mkdir(os.path.join(args.path, "stage1"))
+    if not os.path.exists(os.path.join(args.path, "stage2")):
         os.mkdir(os.path.join(args.path, "stage2"))
-        # os.mkdir(os.path.join(args.path, "stage3"))
+        os.mkdir(os.path.join(args.path, "stage3"))
 
     L.seed_everything(configs["seed"])
 
@@ -165,7 +164,7 @@ def run() -> None:
             save_top_k=3,  # Save top k checkpoints based on the monitored metric
             save_last=True,  # Save the last checkpoint at the end of training
             dirpath=os.path.join(
-                args.path, "stage1"
+                args.path, "stage2"
             ),  # Directory where the checkpoints will be saved
             filename=filename,  # Checkpoint file naming pattern
         )
@@ -175,12 +174,12 @@ def run() -> None:
             save_top_k=-1,
             save_last=False,  # Save the last checkpoint at the end of training
             dirpath=os.path.join(
-                args.path, "stage1"
+                args.path, "stage2"
             ),  # Directory where the checkpoints will be saved
             filename=filename,  # Checkpoint file naming pattern
         )
 
-        name = configs["training"]["name"] + "_stage1"
+        name = configs["training"]["name"] + "_stage2"
 
         logger = TensorBoardLogger(logger_path, name=name)
         trainer = Trainer(
@@ -196,25 +195,25 @@ def run() -> None:
             strategy=args.strategy,
         )
 
-        print("start training stage 1")
+        print("start training stage 2")
         # if args.checkpoint is not None:
         #     trainer.fit(model, ds, ckpt_path=args.checkpoint)
         # else:
-        if os.path.exists(os.path.join(args.path, "stage1", "last.ckpt")):
+        if os.path.exists(os.path.join(args.path, "stage2", "last.ckpt")):
             print(
                 "resuming from checkpoint ",
-                os.path.join(args.path, "stage1", "last.ckpt"),
+                os.path.join(args.path, "stage2", "last.ckpt"),
             )
             trainer.fit(
-                model, ds, ckpt_path=os.path.join(args.path, "stage1", "last.ckpt")
+                model, ds, ckpt_path=os.path.join(args.path, "stage2", "last.ckpt")
             )
         else:
             trainer.fit(model, ds)
-        print("finish training stage 1")
+        print("finish training stage 2")
     else:
         print("skip training stage 1")
 
-    model = utils.pickAndLoadBest(model, os.path.join(args.path, "stage1"))
+    model = utils.pickAndLoadBest(model, os.path.join(args.path, "stage2"))
 
     if configs["training"]["epochs"][1] > 0:
 
@@ -235,7 +234,7 @@ def run() -> None:
         model.scheduler_step = configs["training"]["epochs"][1]
         model.lr_backbone = 0.0
         model.lr_detr = 0.0
-        name = configs["training"]["name"] + "_stage2"
+        name = configs["training"]["name"] + "_stage3"
         logger = TensorBoardLogger(logger_path, name=name)
 
         checkpoint_callback = ModelCheckpoint(
@@ -244,7 +243,7 @@ def run() -> None:
             save_top_k=3,  # Save top k checkpoints based on the monitored metric
             save_last=True,  # Save the last checkpoint at the end of training
             dirpath=os.path.join(
-                args.path, "stage2"
+                args.path, "stage3"
             ),  # Directory where the checkpoints will be saved
             filename=filename,  # Checkpoint file naming pattern
         )
@@ -254,7 +253,7 @@ def run() -> None:
             save_top_k=-1,
             save_last=False,  # Save the last checkpoint at the end of training
             dirpath=os.path.join(
-                args.path, "stage2"
+                args.path, "stage3"
             ),  # Directory where the checkpoints will be saved
             filename=filename,  # Checkpoint file naming pattern
         )
@@ -272,14 +271,14 @@ def run() -> None:
             strategy=args.strategy,
         )
 
-        print("start training stage 2")
-        if os.path.exists(os.path.join(args.path, "stage2", "last.ckpt")):
+        print("start training stage 3")
+        if os.path.exists(os.path.join(args.path, "stage3", "last.ckpt")):
             print(
                 "resuming from checkpoint ",
-                os.path.join(args.path, "stage2", "last.ckpt"),
+                os.path.join(args.path, "stage3", "last.ckpt"),
             )
             trainer.fit(
-                model, ds, ckpt_path=os.path.join(args.path, "stage2", "last.ckpt")
+                model, ds, ckpt_path=os.path.join(args.path, "stage3", "last.ckpt")
             )
         else:
             trainer.fit(model, ds)
@@ -287,7 +286,7 @@ def run() -> None:
         #     trainer.fit(model, ds, ckpt_path=args.checkpoint)
         # else:
         # trainer.fit(model, ds)
-        print("finish training stage 2")
+        print("finish training stage 3")
     else:
         print("skip training stage 2")
 
