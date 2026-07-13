@@ -20,7 +20,9 @@ TomoGNN is a pipeline for slice-wise detection and mask refinement in cryo-elect
   - `train_full.py` – Two-stage training (Stage 1 → Stage 2) with best-checkpoint handoff
 - `notebooks/` – End-to-end examples and analyses
   - `buildDataset.ipynb` – Construct dataset pickle from tomograms + label volumes
+  - `train3DCNN.ipynb` – Train the optional 3D CNN scorer on particle crops
   - `trainModel.ipynb` – Minimal training walkthrough with Lightning
+  - `scan_particle_with3DCNN_pipeline.ipynb` – End-to-end particle scan pipeline with optional 3D CNN rescoring
   - `scan_particles.ipynb` – Particle scanning, post-processing, 3D CNN scoring
   - `scan_organelle.ipynb` – Organelle detection and mask refinement
 - `datasets/` – Place dataset pickle files here (not included)
