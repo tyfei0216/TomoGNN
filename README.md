@@ -18,6 +18,7 @@ TomoGNN is a pipeline for slice-wise detection and mask refinement in cryo-elect
 - `scripts/` – Training entry points
   - `train.py` – Single-stage training driven by `<path>/config.json`
   - `train_full.py` – Two-stage training (Stage 1 → Stage 2) with best-checkpoint handoff
+  - `result/` – Saved experiment outputs/checkpoints from prior runs
 - `notebooks/` – End-to-end examples and analyses
   - `buildDataset.ipynb` – Construct dataset pickle from tomograms + label volumes
   - `train3DCNN.ipynb` – Train the optional 3D CNN scorer on particle crops
@@ -32,7 +33,7 @@ Example data and trained models used by notebooks in this repository are availab
 
 - Dataset: [tyfei216/TomoGNN_data](https://huggingface.co/datasets/tyfei216/TomoGNN_data)
 - Model checkpoints: [tyfei216/TomoGNN](https://huggingface.co/tyfei216/TomoGNN)
-- Contents: notebook-ready example tomograms/labels and pretrained checkpoints for workflows under `notebooks/`
+- Contents: notebook-ready example tomograms/labels (dataset repo) and pretrained checkpoints (model repo) for workflows under `notebooks/`
 
 Use the separate data repository for example tomograms and labels, and use the model repository for pretrained checkpoints when running the notebook pipelines.
 
@@ -81,12 +82,15 @@ python scripts/train_full.py -p /path/to/experiment -d 0
 ```
 - Stage 1 typically uses `data.require_mask=True` and trains representation with mask supervision.
 - Stage 2 uses `data.require_mask=False` and focuses on detection; best Stage 1 checkpoint is loaded automatically.
+- Checkpoints are written to `/path/to/experiment/stage2` and `/path/to/experiment/stage3` for the two training phases.
 
 ### 4) Inference & Post-processing
 - Particles: `notebooks/scan_particles.ipynb`
   - Build `MrcDataset`, run detector to produce a candidates DataFrame `df`.
   - Post-process with class-specific thresholds, NMS, and DBSCAN.
   - Optionally re-score candidates with 3D CNN crops (`Particle3DDataset`), then recompute metrics.
+- End-to-end particle + rescoring pipeline: `notebooks/scan_particle_with3DCNN_pipeline.ipynb`
+  - Runs particle detection, post-processing, and optional 3D CNN rescoring in one workflow.
 - Organelles: `notebooks/scan_organelle.ipynb`
   - Detect nucleus/mitochondria, visualize per-slice detections.
   - Switch to mask stage and refine masks with per-class morphology + thresholds.
