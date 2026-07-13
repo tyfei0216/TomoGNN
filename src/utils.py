@@ -1680,27 +1680,30 @@ def readTomogram(filename):
         return m.data
 
 
-def pickAndLoadBest(model, path):
-    pattern = re.compile(
-        r"epoch=(\d+)"
-        r"(?:-total_validate_auroc=([0-9.]+))?"
-        r"-total_validate_loss=([0-9.]+)"
-        r"(?:-v(\d+))?"
-        r"\.ckpt$"
-    )
-    for i in os.listdir(path):
-        best = ""
-        loss_best = 1e100
-        if i.endswith(".ckpt"):
-            m = pattern.match(i)
-            if m is not None:
-                epoch = int(m.group(1))
-                auroc = float(m.group(2)) if m.group(2) is not None else 0
-                loss = float(m.group(3))
-                v = int(m.group(4)) if m.group(4) is not None else 0
-                if loss_best > loss:
-                    loss_best = loss
-                    best = i
+def pickAndLoadBest(model, path, load_last=True):
+    if load_last:
+        best = "last.ckpt"
+    else:
+        pattern = re.compile(
+            r"epoch=(\d+)"
+            r"(?:-total_validate_auroc=([0-9.]+))?"
+            r"-total_validate_loss=([0-9.]+)"
+            r"(?:-v(\d+))?"
+            r"\.ckpt$"
+        )
+        for i in os.listdir(path):
+            best = ""
+            loss_best = 1e100
+            if i.endswith(".ckpt"):
+                m = pattern.match(i)
+                if m is not None:
+                    epoch = int(m.group(1))
+                    auroc = float(m.group(2)) if m.group(2) is not None else 0
+                    loss = float(m.group(3))
+                    v = int(m.group(4)) if m.group(4) is not None else 0
+                    if loss_best > loss:
+                        loss_best = loss
+                        best = i
     a = torch.load(os.path.join(path, best), map_location="cpu")["state_dict"]
 
     # Check parameters and remove incompatible ones
