@@ -28,7 +28,8 @@ tomoGNN is a pipeline for slice-wise detection and mask refinement in cryo-elect
 ## Hugging Face Assets
 Example data and trained models used by notebooks in this repository are available on Hugging Face, with the data stored separately from the pretrained checkpoints:
 
-- Data repository: [tyfei216/TomoGNN_data](https://huggingface.co/tyfei216/TomoGNN_data)
+- Dataset: [tyfei216/TomoGNN_data](https://huggingface.co/datasets/tyfei216/TomoGNN_data)
+- Model checkpoints: [tyfei216/TomoGNN](https://huggingface.co/tyfei216/TomoGNN)
 - Contents: notebook-ready example tomograms/labels and pretrained checkpoints for workflows under `notebooks/`
 
 Use the separate data repository for example tomograms and labels, and use the model repository for pretrained checkpoints when running the notebook pipelines.
