@@ -1,6 +1,6 @@
 # TomoGNN: DETR + GNN for Cryo-ET Organelles & Particles
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21502804.svg)](https://doi.org/10.5281/zenodo.21502804)
+[![DOI](assets/badges/zenodo-doi.svg)](https://doi.org/10.5281/zenodo.21502804)
 
 TomoGNN is a pipeline for slice-wise detection and mask refinement in cryo-electron tomography (cryo-ET) volumes. It combines a DETR-based detector with graph neural network (GNN) context, optional mask heads, and a lightweight 3D CNN scorer to identify organelles (e.g., mitochondria, nucleus) and particles (e.g., ribosome, hsp60).
 
