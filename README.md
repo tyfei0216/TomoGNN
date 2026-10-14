@@ -28,6 +28,7 @@ TomoGNN is a pipeline for slice-wise detection and mask refinement in cryo-elect
   - `scan_particle_with3DCNN_pipeline.ipynb` – End-to-end particle scan pipeline with optional 3D CNN rescoring
   - `scan_particles.ipynb` – Particle scanning, post-processing, 3D CNN scoring
   - `scan_organelle.ipynb` – Organelle detection and mask refinement
+  - `SHREC.ipynb` – SHREC 2021 benchmark demo: two-stage particle detection with official-style F1 evaluation
 - `datasets/` – Place dataset pickle files here (not included)
 
 ## Hugging Face Assets
@@ -96,6 +97,12 @@ python scripts/train_full.py -p /path/to/experiment -d 0
 - Organelles: `notebooks/scan_organelle.ipynb`
   - Detect nucleus/mitochondria, visualize per-slice detections.
   - Switch to mask stage and refine masks with per-class morphology + thresholds.
+
+### 5) SHREC 2021 Benchmark Demo
+- `notebooks/SHREC.ipynb` runs the released SHREC 2021 pipeline on the example `shrec.mrc` tomogram (model_9, 512³) and reports the official-style F1 score.
+- Loads paired detector (`last.ckpt`) + 3D CNN classifier (`3DCNN.ckpt`) checkpoints for the `small` and `large` particle groups under `release_model/SHREC/`.
+- Stage 1: slice-wise detector proposals with distance-based sweep filtering; Stage 2: 3D CNN classifies 41³ crops and refines centers via weighted-average decoding.
+- Evaluation uses the official dilated class-mask hit rule and reports mean per-class F1 with and without 4V94 (whose labels are known to be buggy).
 
 ## Configuration Notes
 - `model.stage` controls the training and evaluation flow (e.g., `"stage 1 mask"`, `"stage 1 + 2"`, `"stage mask"`).
