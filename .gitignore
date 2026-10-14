@@ -8,3 +8,4 @@ examples/
 test/
 revise_notebooks/
 .vscode
+release_model/
