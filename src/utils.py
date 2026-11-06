@@ -3,6 +3,7 @@ import os
 import pickle
 import random
 import re
+import warnings
 from typing import List
 
 import mrcfile
@@ -1246,6 +1247,12 @@ def buildModel(configs, args, checkpoint=None):
                 need_del.append(i)
         for i in need_del:
             del ckpt[i]
+        if need_del:
+            warnings.warn(
+                f"Skipping mismatched model parameters: {need_del}",
+                UserWarning,
+                stacklevel=2,
+            )
         model.load_state_dict(ckpt, strict=False)
 
     return model
@@ -1378,9 +1385,13 @@ def getModel(configs):
                 need_del.append(i)
         for i in need_del:
             del ckpt[i]
-        print("incompatible parameters", need_del)
+        if need_del:
+            warnings.warn(
+                f"Skipping mismatched model parameters: {need_del}",
+                UserWarning,
+                stacklevel=2,
+            )
         model.load_state_dict(ckpt, strict=False)
-        print("finish loading parameters")
 
     return model
 
@@ -1416,9 +1427,13 @@ def loadModel(path, checkpoint="last.ckpt"):
             need_del.append(i)
     for i in need_del:
         del ckpt[i]
-    print("incompatible parameters", need_del)
+    if need_del:
+        warnings.warn(
+            f"Skipping mismatched model parameters: {need_del}",
+            UserWarning,
+            stacklevel=2,
+        )
     model.load_state_dict(ckpt, strict=False)
-    print("finish loading parameters")
 
     # need_del = []
     # p = [j for j, _ in model.named_parameters()]
@@ -1715,7 +1730,11 @@ def pickAndLoadBest(model, path, load_last=True):
     for i in need_del:
         del a[i]
     if need_del:
-        print("incompatible parameters removed:", need_del)
+        warnings.warn(
+            f"Skipping mismatched model parameters: {need_del}",
+            UserWarning,
+            stacklevel=2,
+        )
 
     model.load_state_dict(a, strict=False)
     return model
